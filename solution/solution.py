@@ -11,6 +11,7 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import NamedTuple
+from urllib.parse import urlparse
 
 sys.path.insert(0, str(next(d / "harness" for d in Path(__file__).resolve().parents
                              if (d / "harness" / "contract.py").exists())))
@@ -18,11 +19,13 @@ from contract import Answer, Conflict, Source  # noqa: E402
 
 TOKEN = re.compile(r"[a-z]+(?:'[a-z]+)?|\d+(?:[.,]\d+)*", re.I)
 NUMBER = re.compile(r"(?:\$\s*)?\d[\d,]*(?:\.\d+)?\s*%?")
+TIME = re.compile(r"\b\d{1,2}(?::\d\d)?\s*(?:a\.?m\.?|p\.?m\.?)", re.I)
+ADDRESS = re.compile(r"\b\d{2,6}\s+[^,]+,\s*[^,]+,\s*[A-Z]{2},?\s*\d{5}\b")
 STOP = set("a an and are as at be by can do does for from have how i in is it me my of on or our please tell the to us was what when where which who with would you your dupaco rate rates interest apr apy current today".split())
 
 
 def words(s):
-    return [w.lower() for w in TOKEN.findall(s)]
+    return [w.lower().removesuffix("'s") for w in TOKEN.findall(s)]
 
 
 def useful(s):
@@ -40,6 +43,32 @@ def clean(s):
     return re.sub(r"[*_`\\]", "", s).strip()
 
 
+def links(s):
+    """Keep literal Markdown destinations, including fragments and query strings."""
+    out = []
+    for match in re.finditer(r"(?<!!)\[([^]]+)\]\(", s):
+        start, depth, pos = match.end(), 1, match.end()
+        while pos < len(s) and depth:
+            if s[pos] == "\\":
+                pos += 2
+                continue
+            if s[pos] == "(":
+                depth += 1
+            elif s[pos] == ")":
+                depth -= 1
+            pos += 1
+        if depth:
+            continue
+        raw = s[start:pos - 1].strip()
+        if raw.startswith("<") and ">" in raw:
+            target = raw[1:raw.index(">")]
+        else:
+            target = re.split(r'\s+"', raw, maxsplit=1)[0]
+        if target:
+            out.append((clean(match.group(1)), target))
+    return tuple(out)
+
+
 class Passage(NamedTuple):
     text: str
     url: str
@@ -48,21 +77,39 @@ class Passage(NamedTuple):
     heading: str
     kind: str
     row_key: str = ""
+    context: str = ""
+    links: tuple = ()
 
 
 def passages(page, sid):
-    """Yield text blocks; table cells stay attached to their column labels."""
+    """Yield blocks with bounded section and location context."""
     lines = page.markdown.splitlines()
-    heading = ""
+    headings = []
+    label = ""
+    location_kind = ""
+    location_identity = ""
     paragraph = []
     headers = None
 
+    def context():
+        return " ".join(x for x in [*(h for _, h in headings), label,
+                                    location_kind, location_identity] if x)
+
     def flush():
+        nonlocal location_identity
         if paragraph:
-            body = clean(" ".join(paragraph))
+            raw = " ".join(paragraph)
+            body = clean(raw)
+            found_links = links(raw)
             paragraph.clear()
-            if len(body) >= 18 and not body.startswith("http"):
-                return Passage(body[:1100], page.url, page.title, sid, heading, "text")
+            if location_kind == "Branch":
+                address = ADDRESS.search(body)
+                if address:
+                    location_identity = address.group(0)
+            if (len(body) >= 18 or found_links and len(body) >= 8) and not body.startswith("http"):
+                heading = headings[-1][1] if headings else ""
+                return Passage(body[:1100], page.url, page.title, sid, heading,
+                               "text", context=context(), links=found_links)
         return None
 
     for line in lines + [""]:
@@ -79,14 +126,21 @@ def passages(page, sid):
                 continue
             row = "; ".join(f"{h}: {v}" for h, v in zip(headers, cells) if v)
             if row:
-                yield Passage(row, page.url, page.title, sid, heading, "table", cells[0])
+                heading = headings[-1][1] if headings else ""
+                yield Passage(row, page.url, page.title, sid, heading,
+                              "table", cells[0], context())
             continue
         headers = None
         if line.startswith("#"):
             p = flush()
             if p:
                 yield p
-            heading = clean(line.lstrip("# "))
+            level = len(line) - len(line.lstrip("#"))
+            headings = [(n, h) for n, h in headings if n < level]
+            headings.append((level, clean(line.lstrip("# "))))
+            label = ""
+            if level <= 3:
+                location_kind = location_identity = ""
             continue
         if not line or line == "* * *":
             p = flush()
@@ -95,6 +149,17 @@ def passages(page, sid):
             continue
         if line.startswith("![") or line.startswith("[") and len(line) > 250:
             continue
+        plain = clean(line).strip()
+        if line.startswith(("**", "__")) and plain.lower() in ("lobby", "drive-up", "drive up"):
+            p = flush()
+            if p:
+                yield p
+            label = plain
+            continue
+        if plain.lower().endswith("branch") and len(plain) < 35 and not any(c.isdigit() for c in plain):
+            location_kind = "Branch"
+        elif plain.lower().endswith("atm") and len(plain) < 35 and not any(c.isdigit() for c in plain):
+            location_kind = "ATM"
         paragraph.append(line)
 
 
@@ -108,14 +173,31 @@ class SnapshotIndex:
         self.lengths = []
         self.pages = {p.url: p for p in snap.pages}
         for page in snap.pages:
-            for p in passages(page, snap.snapshot_id):
-                i = len(self.passages)
-                self.passages.append(p)
-                tf = Counter(useful(p.text))
-                self.lengths.append(sum(tf.values()))
-                for token, count in tf.items():
-                    self.postings[token].append((i, count))
-                    self.df[token] += 1
+            self.passages.extend(passages(page, snap.snapshot_id))
+        repeated = Counter((p.url, p.text) for p in self.passages)
+        for i, p in enumerate(self.passages):
+            tf = Counter()
+            body_weight = .25 if (repeated[(p.url, p.text)] >= 4 and p.kind == "text") else 1.0
+            if len(p.text) < 35 and p.kind == "text" and not p.links and not re.search(r"\d", p.text):
+                body_weight *= .35
+            for token in useful(p.text):
+                tf[token] += body_weight
+            for value, weight in ((p.context, .55), (p.title, .22),
+                                  (urlparse(p.url).path.replace("/", " "), .12)):
+                for token in useful(value):
+                    tf[token] += weight
+            # Product vocabulary in page metadata can connect a common synonym
+            # to a rate row whose body only names its term and value.
+            if re.search(r"\bhome[- ]loans?\b", p.title + " " + p.context, re.I):
+                tf["mortgage"] += .35
+            for anchor, target in p.links:
+                parsed = urlparse(target)
+                for token in useful(parsed.netloc + " " + parsed.path.replace("/", " ")):
+                    tf[token] += .20
+            self.lengths.append(sum(tf.values()))
+            for token, count in tf.items():
+                self.postings[token].append((i, count))
+                self.df[token] += 1
         self.avg_length = sum(self.lengths) / max(1, len(self.lengths))
 
     def search(self, question, limit=12):
@@ -135,6 +217,8 @@ class SnapshotIndex:
         qset = set(q)
         lower_question = question.lower()
         wants_value = bool(re.search(r"\b(?:rates?|aprs?|apys?|fees?|cost|price|yield)\b", lower_question))
+        wants_hours = bool(re.search(r"\bhours?\b", lower_question))
+        wants_address = bool(re.search(r"\baddress\b", lower_question))
         topic_phrases = ("share savings", "bright savings", "personal loan", "auto loan",
                          "mortgage", "credit card", "certificate", "routing number",
                          "branch", "checking", "construction loan")
@@ -165,6 +249,10 @@ class SnapshotIndex:
                     score *= 1.5
                 else:
                     score *= .55
+            if wants_hours:
+                score *= 2.2 if TIME.search(p.text) else .65
+            if wants_address and "branch" in lower_question and "branch" in p.context.lower() and ADDRESS.search(p.text):
+                score *= 1.6
             # Match a requested term to its row, rather than a different tier
             # on a relevant rate sheet.
             for amount in re.findall(r"\b\d{1,3}(?:,\d{3})?\s*[- ]\s*(?:month|year)\b", lower_question):
@@ -208,18 +296,37 @@ class LexicalKnowledge:
         hits = index.search(question)
         if not hits:
             return Answer("I don't know; please contact us for details.", confident=False)
-        match_terms = set(useful(question)) & set(useful(hits[0][1].text + " " + hits[0][1].title))
+        best = hits[0][1]
+        wants_link = bool(re.search(r"\b(?:url|link|website)\b|\bonline\b.*\b(?:join|apply|open)\b|\b(?:join|apply|open)\b.*\bonline\b",
+                                    question.lower()))
+        link_match = wants_link and any(
+            set(useful(question)) & set(useful(anchor)) and target.startswith(("https://", "http://"))
+            for anchor, target in best.links)
+        match_terms = set(useful(question)) & set(useful(
+            best.text + " " + best.context + " " + best.title + " " +
+            urlparse(best.url).path.replace("/", " ")))
         min_score = min(3.0, .3 * math.log(len(index.passages) + 1))
-        if hits[0][0] < min_score or (len(set(useful(question))) >= 2 and len(match_terms) < 2):
+        if hits[0][0] < min_score or (len(set(useful(question))) >= 2 and len(match_terms) < 2 and not link_match):
             return Answer("I don't know; please contact us for details.", confident=False)
         best_score, best = hits[0]
+        # Context establishes relevance, while the passage must still contain
+        # the requested kind of evidence before it can be used as an answer.
+        branch_name = re.search(r"\b([A-Z][A-Za-z-]+(?:\s+[A-Z][A-Za-z-]+){0,2})\s+[Bb]ranch\b", question)
+        if branch_name and branch_name.group(1).lower() not in (
+                best.text + " " + best.context + " " + best.title).lower():
+            return Answer("I don't know; please contact us for that branch.", confident=False)
+        if re.search(r"\baddress\b", question.lower()) and not ADDRESS.search(best.text):
+            return Answer("I don't know; please contact us for the address.", confident=False)
+        procedure = re.search(r"\bhow (?:can|do) i ([a-z]+)\b", question.lower())
+        if procedure and procedure.group(1) not in words(best.text) and not link_match:
+            return Answer("I don't know; please contact us for details.", confident=False)
         requested_terms = re.findall(r"\b\d{1,3}\s*[- ]\s*(?:month|year)\b", question.lower())
         normalized_best = re.sub(r"\s*[- ]\s*", " ", best.text.lower())
         if requested_terms and not all(re.sub(r"\s*[- ]\s*", " ", t) in normalized_best for t in requested_terms):
             return Answer("I don't know; please contact us for that term.", confident=False)
         if re.search(r"\b(?:rate|apr|apy|interest)\b", question.lower()) and not re.search(r"\d[\d,.]*\s*%", best.text):
             return Answer("I don't know; please contact us for the current rate.", confident=False)
-        if re.search(r"\bhours?\b", question.lower()) and not re.search(r"\b\d{1,2}(?::\d\d)?\s*(?:a\.?m\.?|p\.?m\.?)\b", best.text, re.I):
+        if re.search(r"\bhours?\b", question.lower()) and not TIME.search(best.text):
             return Answer("I don't know; please contact us for the branch hours.", confident=False)
         # A broad question can benefit from several distinct rows or pages.
         broad = bool(re.search(r"\b(?:rates|cards|options|hours|branches)\b", question.lower())) and not re.search(r"\b\d+(?:-month|-year)?\b", question.lower())
@@ -237,8 +344,16 @@ class LexicalKnowledge:
         for p in selected:
             if p.url not in {s.url for s in sources}:
                 sources.append(Source(p.url, p.snapshot_id, p.text[:220]))
-        if re.search(r"\b(?:url|link|website)\b", question.lower()) and sources:
-            body = sources[0].url
+        if wants_link and sources:
+            qterms = set(useful(question))
+            candidates = [(len(qterms & set(useful(anchor))), target) for anchor, target in best.links
+                          if target.startswith(("https://", "http://"))]
+            candidates.sort(key=lambda x: -x[0])
+            if candidates and candidates[0][0]:
+                body = candidates[0][1]
+                sources[0] = Source(best.url, best.snapshot_id, body)
+            else:
+                body = sources[0].url
         return Answer(body, sources)
 
     def conflicts(self):
