@@ -1,0 +1,33 @@
+# Privately supplied participant kit and evaluation data
+/snapshots/
+/snapshots_zip/
+/eval/
+/harness/selftest/
+/Knowledge-Hackathon-Assignment.pdf
+
+# Generated local output
+/results/
+/diagnostics/
+/ok
+*.log
+
+# Credentials and local environments
+.env
+.env.*
+!.env.example
+.aws/
+*.pem
+*.key
+*.p12
+*.pfx
+.venv/
+venv/
+.uv/
+
+# Python and editor caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
