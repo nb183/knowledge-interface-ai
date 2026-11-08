@@ -1,6 +1,6 @@
 # Project plan
 
-## Current state: Phase 3A implemented, awaiting review
+## Current state: Phase 3B implemented, awaiting review
 
 The initial deterministic lexical submission is in `solution/`. The Phase 1 public baseline was **0.5044 QA** on 40 questions, with **0.03 s p50**, **0.09 s p95**, **1.0 consistency**, zero runtime errors, and zero stale-trap hits. The official rerun before Phase 3A reproduced that baseline. These are public-kit measurements, not hidden-set or production results. The public run did not include a conflict gold file.
 
@@ -8,17 +8,25 @@ The initial deterministic lexical submission is in `solution/`. The Phase 1 publ
 
 The question-by-question diagnosis found that passage body-only postings omitted relevant facts whose matching terms appeared in headings, page titles, or link targets. Branch schedules lost their section labels, short links were often dropped, and repeated locator/navigation text competed with factual passages. Other misses need source authority, multi-passage answers, or conflict resolution, which are outside Phase 3A.
 
-## Phase 3A: retrieval context (implemented, awaiting review)
+## Phase 3A: retrieval context (complete)
 
 The approved change adds bounded heading and branch context, weighted title/path/link metadata, literal Markdown link targets, and structural downweighting of repeated or short boilerplate. Answer checks still require explicit value, time, address, action, or link evidence. Snapshot selection and the public contract remain unchanged.
 
 The final official public rerun after implementation scored **0.5915 QA** (**+0.0871**), with **0.07 s p50**, **0.16 s p95**, **1.0 consistency**, zero errors, and zero stale-trap hits. Four questions gained score: `dup-034` 0.2917→1.0, `dup-066` 0→0.85, `dup-068` 0→1.0, and `dup-082` 0→1.0. No question lost score; all 18 baseline full-credit cases remain full-credit. Ingest time rose from **3.1 s** to **9.1 s**, within the 30-minute limit. Branch information rose from **0.1667** to **0.475**, list completeness from **0.4479** to **0.625**, and stale-trap questions from **0.4679** to **0.6107**. Other category scores were unchanged.
 
-Focused synthetic-snapshot tests cover heading-only retrieval, mortgage rows, table labels, branch and ATM boundaries, schedules, literal link destinations with query strings and fragments, procedural evidence, boilerplate ranking, and historical selection. The ten test functions passed via a standard-library runner; `pytest` is unavailable in the current environment. No commit or push has been made.
+Focused synthetic-snapshot tests cover heading-only retrieval, mortgage rows, table labels, branch and ATM boundaries, schedules, literal link destinations with query strings and fragments, procedural evidence, boilerplate ranking, and historical selection. The ten Phase 3A test functions passed via a standard-library runner; `pytest` is unavailable in the current environment. Phase 3A was committed as `55999bf`; it was not pushed.
 
-## Later accuracy and conflict work (planned)
+## Phase 3B: question-aware evidence selection (implemented, awaiting review)
 
-Improve source authority, answer completeness across passages, and cross-page conflict resolution under separate approval. Current retrieval can still favor a special mortgage program over general rates or a dated release over the requested time period. Public conflict accuracy remains unmeasured without a gold file. Acceptance: focused regression tests, contract-compliant answers and sources, and public evaluation against Phase 3A. Explain any score regression.
+The approved change separates request parsing, retrieval, passage-level sufficiency checks, compatible-fact selection, and answer composition. Required qualifiers must match; unspecified qualifiers remain available for broad answers; incompatible candidates are excluded. Broad card, certificate, mortgage, and branch-hour answers aggregate labelled facts with citations. When equally applicable evidence gives different values for the same fact, the system keeps the competing passages internally and abstains. The public contract, snapshot selection, and `conflicts()` remain unchanged; no LLM or API dependency was added.
+
+The official Phase 3A rerun immediately before editing scored **0.5915 QA** on 40 questions, with **0.07 s p50**, **0.17 s p95**, **9.1 s ingest**, zero errors, and zero stale-value trap hits. The final Phase 3B run scored **0.7124 QA** (**+0.1209**), with **0.07 s p50**, **0.16 s p95**, **9.2 s ingest**, zero errors, and zero stale-value trap hits. Consistency remained **1.0**. Question gains were `dup-064` 0→0.85, `dup-145` 0→1.0, `dup-065` 0→1.0, `dup-040` 0.5→1.0, `dup-031` 0→1.0, and `dup-104` 0→1.0. The regression was `dup-009` 0.575→0: it now abstains because different pages in the selected snapshot give incompatible 30-year mortgage rates for the same amount tiers. No baseline full-credit question regressed, and no newly confident zero-credit answer appeared.
+
+Category scores changed as follows: branch information **0.475→0.95**, current values **0.3333→0.6667**, list completeness **0.625→0.75**, should-refuse **0.6667→1.0**, and stale-trap **0.6107→0.5286**. Conflict resolution stayed **0**, entity attribution **1.0**, temporal as-of **0.75**, and tier disambiguation **0.8333**. Seventeen focused test functions passed via a standard-library runner; `pytest` remains unavailable. No Phase 3B commit or push has been made.
+
+## Later source-authority and conflict work (planned)
+
+Resolve contradictory dated rate pages and cross-page factual conflicts under a separate approval. A general mortgage question now safely abstains when its selected snapshot contains incompatible rate tables, and the public conflict pillar remains unmeasured without a gold file. Acceptance: focused regression tests, contract-compliant answers and sources, and a public evaluation against Phase 3B with every score regression explained.
 
 ## Final validation (planned)
 

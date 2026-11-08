@@ -156,6 +156,12 @@ def passages(page, sid):
                 yield p
             label = plain
             continue
+        inline_label = re.match(r"^(?:\*\*|__)(Lobby|Drive-up|Drive up)(?:\*\*|__)\s+", line, re.I)
+        if inline_label:
+            p = flush()
+            if p:
+                yield p
+            label = inline_label.group(1)
         if plain.lower().endswith("branch") and len(plain) < 35 and not any(c.isdigit() for c in plain):
             location_kind = "Branch"
         elif plain.lower().endswith("atm") and len(plain) < 35 and not any(c.isdigit() for c in plain):
@@ -277,9 +283,313 @@ class SnapshotIndex:
         return [(score, self.passages[i]) for score, i in ranked[:limit]]
 
 
+class RequestSpec(NamedTuple):
+    intent: str
+    product: str
+    qualifiers: dict
+
+
+class Evidence(NamedTuple):
+    passage: Passage
+    rank: int
+    score: float
+    key: tuple
+    value: str
+    text: str
+
+
+class Selection(NamedTuple):
+    evidence: tuple
+    conflicts: tuple
+
+
+def qualifier_state(required, observed):
+    """Report a required match, an unspecified constraint, or incompatibility."""
+    if required is None:
+        return "unspecified"
+    return "required" if observed == required else "incompatible"
+
+
+def parse_request(question):
+    lower = question.lower()
+    term = re.search(r"\b(\d{1,3})\s*[- ]\s*(month|year)\b", lower)
+    arm = re.search(r"\b\d{1,2}/\d{1,2}\b", lower)
+    branch = re.search(r"\b([A-Z][A-Za-z-]+(?:\s+[A-Z][A-Za-z-]+){0,2})\s+[Bb]ranch\b", question)
+    amount = re.search(r"\$\s*([\d,]+(?:\.\d+)?)", question)
+    qualifiers = {
+        "term": arm.group(0) if arm else (f"{term.group(1)} {term.group(2)}" if term else None),
+        "tier_amount": float(amount.group(1).replace(",", "")) if amount else None,
+        "branch": branch.group(1).lower() if branch else None,
+        "service": "drive-up" if re.search(r"\bdrive[- ]up\b", lower) else
+                   ("lobby" if "lobby" in lower else None),
+        "transaction": "refinance" if "refinanc" in lower else
+                       ("purchase" if "purchase" in lower else None),
+        "scope": "business" if "business" in lower else
+                 ("personal" if "personal" in lower else None),
+        "day": next((d for d in ("monday", "tuesday", "wednesday", "thursday", "friday",
+                                 "saturday", "sunday") if d in lower), None),
+    }
+    if re.search(r"\b(?:url|link|website)\b", lower):
+        return RequestSpec("legacy", "", qualifiers)
+    if re.search(r"\bmortgage\b|\bhome[- ]loans?\b", lower) and re.search(r"\brate|\bapr|\binterest", lower):
+        qualifiers["program"] = "special" if re.search(r"\b(relief|special|promotion|intro)\b", lower) else "standard"
+        return RequestSpec("mortgage_rate" if qualifiers["term"] else "mortgage_overview",
+                           "mortgage", qualifiers)
+    if re.search(r"\bcredit cards?\b", lower) and re.search(r"\brat|\bapr|\boffer", lower):
+        return RequestSpec("list", "card", qualifiers)
+    if re.search(r"\b(certificates?|cds?)\b", lower) and re.search(r"\brat|\bapy", lower) and not qualifiers["term"]:
+        return RequestSpec("list", "certificate", qualifiers)
+    if re.search(r"\bhours?\b", lower) and ("branch" in lower or qualifiers["service"]):
+        return RequestSpec("hours_compare" if re.search(r"\b(?:all|same|vary|different)\b", lower)
+                           else "hours", "branch", qualifiers)
+    program = re.search(r"\bwhat is (?:\w+(?:'s)?\s+)?(.+?)\s+program\b", question, re.I)
+    if program:
+        qualifiers["program_name"] = program.group(1).strip().lower()
+        return RequestSpec("definition", "program", qualifiers)
+    return RequestSpec("legacy", "", qualifiers)
+
+
+def retrieve_candidates(index, question, spec):
+    """Retrieve only from the already selected full snapshot."""
+    limit = 160 if spec.intent != "legacy" else 12
+    return [(rank, score, passage) for rank, (score, passage) in
+            enumerate(index.search(question, limit=limit), 1)]
+
+
+def _field(text, label):
+    match = re.search(r"(?:^|; )" + re.escape(label) + r":\s*([^;]+)", text, re.I)
+    return match.group(1).strip() if match else ""
+
+
+def _rate(text, label="Rate"):
+    match = re.search(r"(?:^|; )" + re.escape(label) + r"(?:\s*\([^)]*\))?:\s*(\d+(?:\.\d+)?%)", text, re.I)
+    return match.group(1) if match else ""
+
+
+def _card_rate(text):
+    labelled = _rate(text, "APR")
+    if labelled:
+        return labelled
+    spans = re.findall(r"\d+(?:\.\d+)?%\s*[–-]\s*\d+(?:\.\d+)?%\s*APR|\d+(?:\.\d+)?%\s*APR", text, re.I)
+    return re.sub(r"\s*APR$", "", spans[0], flags=re.I).strip() if spans else ""
+
+
+def _assess_mortgage(spec, rank, retrieval_score, passage):
+    if passage.kind != "table":
+        return None
+    q, text = spec.qualifiers, passage.text
+    program = _field(text, "Program") or _field(text, "Term")
+    product_context = (passage.title + " " + passage.context + " " + passage.url).lower()
+    if not re.search(r"mortgage|home[- ]loans?|home rates", product_context):
+        return None
+    if q["scope"] and q["scope"] not in product_context:
+        return None
+    kind = "special" if re.search(r"\b(relief|special|promotion|intro|qualified)\b", program, re.I) else "standard"
+    if qualifier_state(q.get("program"), kind) == "incompatible":
+        return None
+    term = q["term"]
+    if term and not re.search(r"(?<!\d)" + re.escape(term).replace(r"\ ", r"[- ]") + r"\b", program.lower()):
+        return None
+    if not term and not re.search(r"\b\d{1,3}[- ]year\b", program, re.I):
+        return None
+    transaction = "refinance" if "refinance" in program.lower() else "purchase" if "purchase" in program.lower() else ""
+    if qualifier_state(q["transaction"], transaction) == "incompatible":
+        return None
+    rate = _rate(text)
+    if not rate:
+        return None
+    term_found = re.search(r"\b\d{1,3}[- ]year\b|\b\d{1,2}/\d{1,2}\b", program, re.I)
+    tier = re.search(r"\$[\d,]+\s+or\s+less", program, re.I)
+    if q["tier_amount"] is not None and (not tier or
+            float(re.search(r"\d[\d,]*", tier.group(0)).group(0).replace(",", "")) < q["tier_amount"]):
+        return None
+    key = ("mortgage", term_found.group(0).lower() if term_found else term,
+           tier.group(0).replace(",", "") if tier else "", transaction)
+    return Evidence(passage, rank, retrieval_score + 8, key, rate, f"{program.strip()}; Rate: {rate}")
+
+
+def _assess_card(spec, rank, retrieval_score, passage):
+    text = passage.text
+    name_match = re.search(r"\b(?:Business\s+)?[A-Z][A-Za-z-]+\s+Visa\b", text + " " + passage.context)
+    rate = _card_rate(text)
+    if not name_match or not rate:
+        return None
+    name = " ".join(name_match.group(0).split())
+    scope = "business" if name.lower().startswith("business") else "personal"
+    if qualifier_state(spec.qualifiers["scope"], scope) == "incompatible":
+        return None
+    return Evidence(passage, rank, retrieval_score + (8 if passage.kind == "table" else 4),
+                    ("card", name.lower()), rate, f"{name}: {rate} APR")
+
+
+def _assess_certificate(spec, rank, retrieval_score, passage):
+    text = passage.text
+    if passage.kind != "table" or not text.startswith("Certificate:"):
+        return None
+    scope = "business" if "/business/" in passage.url else "personal" if "/personal/" in passage.url else ""
+    if spec.qualifiers["scope"] and qualifier_state(spec.qualifiers["scope"], scope) == "incompatible":
+        return None
+    certificate = _field(text, "Certificate")
+    apy = re.search(r"Annual Percentage Yield \(APY\):\s*(\d+(?:\.\d+)?%)", text, re.I)
+    if not certificate or not apy:
+        return None
+    return Evidence(passage, rank, retrieval_score + 5,
+                    ("certificate", scope, certificate.lower()), apy.group(1),
+                    f"{certificate}: {apy.group(1)} APY" + (f" ({scope})" if scope else ""))
+
+
+def _assess_branch(spec, rank, retrieval_score, passage):
+    text = passage.text
+    if not TIME.search(text):
+        return None
+    q = spec.qualifiers
+    combined = (text + " " + passage.context + " " + passage.title).lower()
+    service = "drive-up" if "drive-up" in combined or "drive up" in combined else "lobby" if "lobby" in combined else None
+    if qualifier_state(q["service"], service) == "incompatible":
+        return None
+    if q["branch"] and q["branch"] not in combined:
+        return None
+    day = next((d for d in ("monday", "tuesday", "wednesday", "thursday", "friday",
+                            "saturday", "sunday") if d in text.lower()), "")
+    if q["day"] and q["day"] not in text.lower():
+        return None
+    return Evidence(passage, rank, retrieval_score + 4,
+                    ("hours", passage.url, service, day), text, text)
+
+
+def _assess_program(spec, rank, retrieval_score, passage):
+    name, text = spec.qualifiers["program_name"], passage.text
+    combined = (text + " " + passage.context + " " + passage.title).lower()
+    if name not in combined or not re.search(r"\b(provides?|offers?|assistance|grants?|credit toward|benefit)\b", text, re.I):
+        return None
+    if re.search(r"\b(?:for more information|to apply|keep reading)\b", text, re.I) and not re.search(r"\$\s*\d", text):
+        return None
+    amount = re.search(r"\$\s*\d[\d,]*(?:\.\d+)?", text)
+    return Evidence(passage, rank, retrieval_score + (10 if amount else 2),
+                    ("program", name), amount.group(0) if amount else "", text[:500])
+
+
+def assess_evidence(spec, rank, retrieval_score, passage):
+    """Check qualifiers and sufficiency independently of retrieval rank."""
+    assessors = {"mortgage": _assess_mortgage, "card": _assess_card,
+                 "certificate": _assess_certificate, "branch": _assess_branch,
+                 "program": _assess_program}
+    return assessors[spec.product](spec, rank, retrieval_score, passage)
+
+
+def select_evidence(spec, candidates):
+    """Keep incompatible facts out and retain unresolved equal-key conflicts."""
+    ranked = sorted(candidates, key=lambda e: (-e.score, e.rank, e.passage.url))
+    by_key = defaultdict(list)
+    for evidence in ranked:
+        by_key[evidence.key].append(evidence)
+    def compatible(group):
+        values = {item.value for item in group if item.value}
+        if len(values) == 1:
+            return True
+        if not values:
+            return True
+        if group[0].key[0] != "card":
+            numbers = [re.findall(r"\d[\d,]*(?:\.\d+)?", value) for value in values]
+            return all(len(n) == 1 for n in numbers) and len({float(n[0].replace(",", "")) for n in numbers}) == 1
+        ranges = [tuple(float(n) for n in re.findall(r"\d+(?:\.\d+)?", value)) for value in values]
+        full = [r for r in ranges if len(r) == 2]
+        singles = [r[0] for r in ranges if len(r) == 1]
+        return bool(full) and len(set(full)) == 1 and all(full[0][0] <= n <= full[0][1] for n in singles)
+
+    conflicts = tuple(tuple(group) for group in by_key.values() if not compatible(group))
+    safe = [next((item for item in group if "–" in item.value or "-" in item.value), group[0])
+            for group in by_key.values() if compatible(group)]
+    if spec.product == "mortgage" and spec.qualifiers["transaction"] is None:
+        purchase = [e for e in safe if e.key[-1] == "purchase"]
+        if purchase:
+            safe = purchase
+    if spec.product == "mortgage" and spec.qualifiers["tier_amount"] is not None:
+        caps = [float(re.search(r"\d+", e.key[2]).group(0)) for e in safe if e.key[2]]
+        if caps:
+            smallest = min(caps)
+            safe = [e for e in safe if e.key[2] and float(re.search(r"\d+", e.key[2]).group(0)) == smallest]
+    if spec.product == "certificate":
+        unique = []
+        seen = set()
+        for evidence in safe:
+            identity = (evidence.key[-1], evidence.value)
+            if identity not in seen:
+                unique.append(evidence)
+                seen.add(identity)
+        safe = unique
+    safe.sort(key=lambda e: (-e.score, e.rank, e.passage.url))
+    if spec.intent == "definition":
+        safe = safe[:1]
+    if spec.intent == "hours":
+        if safe:
+            first_url = safe[0].passage.url
+            safe = [e for e in safe if e.passage.url == first_url][:5]
+    elif spec.intent == "hours_compare":
+        urls = []
+        for evidence in safe:
+            if evidence.passage.url not in urls:
+                urls.append(evidence.passage.url)
+            if len(urls) >= 1:
+                break
+        first_saturday = {e.value for e in safe if e.passage.url == urls[0]
+                          and "saturday" in e.text.lower()} if urls else set()
+        alternatives = [e for e in safe if e.passage.url not in urls and
+                        "saturday" in e.text.lower() and e.value not in first_saturday]
+        if alternatives:
+            urls.append(alternatives[0].passage.url)
+        else:
+            second = next((e.passage.url for e in safe if e.passage.url not in urls), None)
+            if second:
+                urls.append(second)
+        safe = [e for e in safe if e.passage.url in urls][:10]
+    elif spec.intent == "mortgage_overview":
+        safe = safe[:12]
+    elif spec.intent == "mortgage_rate":
+        safe = safe[:8]
+    elif spec.intent == "list":
+        safe = safe[:24]
+    return Selection(tuple(safe), conflicts)
+
+
+def compose_answer(spec, selection):
+    if selection.conflicts:
+        return Answer("I don't know; please contact us to confirm the conflicting values.", confident=False)
+    if not selection.evidence:
+        return Answer("I don't know; please contact us for details.", confident=False)
+    if spec.intent == "hours_compare" and len({e.passage.url for e in selection.evidence}) < 2:
+        return Answer("I don't know; please contact us for branch-specific hours.", confident=False)
+    chosen = selection.evidence
+    if spec.intent == "definition":
+        chosen = chosen[:1]
+    if spec.intent in ("hours", "hours_compare"):
+        groups = defaultdict(list)
+        for evidence in chosen:
+            groups[evidence.passage.url].append(evidence)
+        schedules = []
+        for group in groups.values():
+            label = (spec.qualifiers["branch"].title() + " Branch" if spec.qualifiers["branch"]
+                     else group[0].passage.title)
+            schedules.append(f"{label}: " + "; ".join(e.text for e in group))
+        text = " | ".join(schedules)
+        if not spec.qualifiers["branch"]:
+            text = "Published branch schedules vary; confirm the branch you plan to visit. " + text
+    else:
+        text = "; ".join(e.text for e in chosen)
+    sources = []
+    for evidence in chosen:
+        p = evidence.passage
+        if p.url not in {s.url for s in sources}:
+            pos = p.text.find(evidence.value) if evidence.value else -1
+            quote = p.text[max(0, pos - 100):pos + len(evidence.value) + 100] if pos >= 0 else p.text[:220]
+            sources.append(Source(p.url, p.snapshot_id, quote))
+    return Answer(text, sources)
+
+
 class LexicalKnowledge:
     def __init__(self):
         self.snapshots = []
+        self.unresolved_evidence = {}
 
     def ingest(self, snapshot):
         self.snapshots.append(SnapshotIndex(snapshot))
@@ -293,6 +603,14 @@ class LexicalKnowledge:
         index = self._select(as_of)
         if index is None:
             return Answer("I don't know; please contact us for details.", confident=False)
+        spec = parse_request(question)
+        if spec.intent != "legacy":
+            retrieved = retrieve_candidates(index, question, spec)
+            evidence = [assess_evidence(spec, rank, score, passage)
+                        for rank, score, passage in retrieved]
+            selection = select_evidence(spec, [item for item in evidence if item is not None])
+            self.unresolved_evidence[(index.snapshot_id, question)] = selection.conflicts
+            return compose_answer(spec, selection)
         hits = index.search(question)
         if not hits:
             return Answer("I don't know; please contact us for details.", confident=False)
