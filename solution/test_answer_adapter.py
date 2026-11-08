@@ -121,3 +121,65 @@ def test_real_snapshot_shadow_never_crosses_selected_snapshot():
         record = ks.shadow_diagnostics[-1]
         assert all(c.snapshot_id == record.snapshot_id for c in record.supporting_claims)
         assert not ks.shadow_errors
+
+
+def test_unspecified_mortgage_transaction_requires_matching_explicit_schedules():
+    def schedule(purchase, refinance):
+        return ("# Rates\n## Home Loans - Purchase\n| Program | Rate |\n| --- | --- |\n"
+                f"| Purchase: 30-Year Fixed Conventional $100,000 or less | {purchase[0]} |\n"
+                f"| Purchase: 30-Year Fixed Conventional $200,000 or less | {purchase[1]} |\n"
+                "Rates are effective as of 09/25/2026.\n"
+                "## Home Loans - Refinance\n| Program | Rate |\n| --- | --- |\n"
+                f"| Refinance: 30-Year Fixed Conventional $100,000 or less | {refinance[0]} |\n"
+                f"| Refinance: 30-Year Fixed Conventional $200,000 or less | {refinance[1]} |\n"
+                "Rates are effective as of 09/25/2026.\n")
+    question = "What is the interest rate for a 30-year mortgage?"
+    ks = build()
+    ks.ingest(Snapshot("one", "2026-09-28", [page("https://example.test/rates", schedule(
+        ("7.13%", "7.25%"), ("7.13%", "7.25%")))]))
+    ks.answer(question)
+    record = ks.shadow_diagnostics[-1]
+    assert record.eligible and len(record.supporting_claims) == 4
+    assert "purchase and refinance" in record.proposed_answer
+    assert {dict(c.identity.qualifiers)["transaction"] for c in record.supporting_claims} == {"purchase", "refinance"}
+    different = build()
+    different.ingest(Snapshot("one", "2026-09-28", [page("https://example.test/rates", schedule(
+        ("7.13%", "7.25%"), ("7.13%", "7.50%")))]))
+    different.answer(question)
+    assert different.shadow_diagnostics[-1].reason == "different_transaction_schedules"
+    one = build()
+    one.ingest(Snapshot("one", "2026-09-28", [page("https://example.test/rates", schedule(
+        ("7.13%", "7.25%"), ("7.13%", "7.25%")).split("## Home Loans - Refinance")[0])]))
+    one.answer(question)
+    assert one.shadow_diagnostics[-1].reason == "ambiguous_mortgage_transaction"
+
+
+def test_untiered_savings_needs_named_complete_schedule():
+    body = ("# Savings Rates\n## Share Savings\n| Account Type | Balance Tier | Dividend Rate | APY |\n"
+            "| --- | --- | --- | --- |\n"
+            "| Share Savings | $0 – $99.99 | 0.00% | 0.00% |\n"
+            "| Share Savings | $100 – $24,999.99 | 0.15% | 0.15% |\n"
+            "| Share Savings | $25,000+ | 0.20% | 0.20% |\n"
+            "Rates are effective as of 06/15/2026.\n"
+            "## Bright Savings\n| Account Type | Balance Tier | Dividend Rate | APY |\n"
+            "| --- | --- | --- | --- |\n"
+            "| Bright Savings | $0.01 – $1,000,000 | 2.23% | 2.25% |\n"
+            "Rates are effective as of 06/02/2026.\n")
+    ks = build()
+    ks.ingest(Snapshot("one", "2026-09-28", [page("https://example.test/rates", body)]))
+    ks.answer("What is the highest Share Savings APY?")
+    assert ks.shadow_diagnostics[-1].eligible
+    assert "0.20%" in ks.shadow_diagnostics[-1].proposed_answer
+    ks.answer("What is the rate for Bright Savings?")
+    assert ks.shadow_diagnostics[-1].eligible
+    assert "2.23%" in ks.shadow_diagnostics[-1].proposed_answer
+    assert "2.25%" in ks.shadow_diagnostics[-1].proposed_answer
+    ks.answer("What is the Share Savings rate?")
+    assert ks.shadow_diagnostics[-1].reason == "savings_tier_unspecified"
+    ks.answer("Do any savings tiers pay 0.35% APY?")
+    assert ks.shadow_diagnostics[-1].reason == "savings_product_unspecified_or_ambiguous"
+    incomplete = build()
+    incomplete.ingest(Snapshot("one", "2026-09-28", [page("https://example.test/rates", body.replace(
+        "| Share Savings | $25,000+ | 0.20% | 0.20% |\n", ""))]))
+    incomplete.answer("What is the highest Share Savings APY?")
+    assert incomplete.shadow_diagnostics[-1].reason == "incomplete_savings_schedule"

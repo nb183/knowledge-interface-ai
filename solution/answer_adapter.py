@@ -104,10 +104,28 @@ def _mortgage(question, spec, index, resolver, target):
     if transaction is None:
         transactions = {_qualifiers(c).get("transaction") for c in index.fact_index.by_family.get("mortgage", ())
                         if c.identity.measure == measure and _qualifiers(c).get("term") == term
-                        and _qualifiers(c).get("program") == "standard"}
-        if len(transactions) != 1 or None in transactions:
+                        and _qualifiers(c).get("program") == "standard"
+                        and _qualifiers(c).get("loan_type") == "conventional"
+                        and _qualifiers(c).get("rate_structure") == "fixed"}
+        if len(transactions) < 2 or None in transactions:
             return None, (), (), "ambiguous_mortgage_transaction"
-        transaction = transactions.pop()
+        proposals = []
+        for named in sorted(transactions):
+            explicit = spec._replace(qualifiers={**q, "transaction": named})
+            text, claims, rules, reason = _mortgage(question, explicit, index, resolver, target)
+            if reason != "accepted":
+                return None, (), rules, "unresolved_mortgage_transaction"
+            proposals.append((named, claims, rules))
+        signatures = [tuple((_tier_cap(c), c.value.raw, c.dates.effective_on) for c in claims)
+                      for _, claims, _ in proposals]
+        if len(set(signatures)) != 1:
+            return None, (), (), "different_transaction_schedules"
+        claims = tuple(c for _, group, _ in proposals for c in group)
+        rules = tuple(dict.fromkeys(rule for _, _, group_rules in proposals for rule in group_rules))
+        tiers = "; ".join(f"up to ${cap:,.0f}: {value}" for cap, value, _ in signatures[0])
+        names = " and ".join(name for name, _, _ in proposals)
+        return (f"Published {names} {term.replace(' ', '-')} fixed conventional mortgage "
+                f"{measure.replace('_', ' ')}s effective {signatures[0][0][2]}: {tiers}."), claims, rules, "accepted"
     candidates = [c for c in index.fact_index.by_family.get("mortgage", ())
                   if _rate_supported(c, term, transaction, measure) and _tier_cap(c) is not None
                   and (q.get("scope") is None or _qualifiers(c).get("scope") == q["scope"])]
@@ -197,7 +215,7 @@ def _savings(question, spec, index, resolver, target):
     q = spec.qualifiers
     amount = q.get("tier_amount")
     if amount is None:
-        return None, (), (), "savings_tier_unspecified"
+        return _untiered_savings(question, index, resolver, target)
     mentioned = re.findall(r"\$\s*([\d,]+(?:\.\d+)?)", question)
     upper = Decimal(mentioned[1].replace(",", "")) if len(mentioned) > 1 else None
     measure = "apy" if "apy" in question.lower() else "dividend_rate" if "dividend rate" in question.lower() else None
@@ -219,6 +237,59 @@ def _savings(question, spec, index, resolver, target):
         return None, (), rules, reason
     return (f"{winner.identity.subject.title()} at the {winner.value.raw} {measure.replace('_', ' ')} "
             f"for balance tier {_qualifiers(winner).get('tier')}."), (winner,), rules, "accepted"
+
+
+def _untiered_savings(question, index, resolver, target):
+    """Use a whole named schedule, or a single explicitly bounded product row."""
+    named = {c.identity.subject for c in index.fact_index.by_family.get("deposit", ())
+             if c.identity.subject in normalize(question)}
+    if len(named) != 1:
+        return None, (), (), "savings_product_unspecified_or_ambiguous"
+    subject = named.pop()
+    lower = question.lower()
+    measure = "apy" if "apy" in lower else "dividend_rate" if "dividend rate" in lower else None
+    if measure is None and not re.search(r"\brate\b", lower):
+        return None, (), (), "savings_measure_unspecified"
+    measures = (measure,) if measure else ("dividend_rate", "apy")
+    rows = [c for c in index.fact_index.by_family.get("deposit", ())
+            if c.identity.subject == subject and c.identity.measure in measures
+            and c.dates.effective_on and c.dates.effective_on <= target
+            and subject in normalize(c.evidence) and _qualifiers(c).get("tier")]
+    if not rows:
+        return None, (), (), "no_named_savings_schedule"
+    schedules = {}
+    for c in rows:
+        schedules.setdefault((c.url, c.section, c.dates.effective_on), []).append(c)
+    key, schedule = max(schedules.items(), key=lambda item: (item[0][2], len(item[1]), item[0][0]))
+    tiers = {_qualifiers(c)["tier"] for c in schedule if c.identity.measure == measures[0]}
+    if "highest" in lower:
+        if measure is None or len(tiers) < 2 or not any(t.endswith("+") for t in tiers):
+            return None, (), (), "incomplete_savings_schedule"
+    elif len(tiers) != 1:
+        return None, (), (), "savings_tier_unspecified"
+    winners, rules = [], []
+    for tier in sorted(tiers):
+        for kind in measures:
+            candidates = [c for c in schedule if _qualifiers(c).get("tier") == tier
+                          and c.identity.measure == kind]
+            if len(candidates) != 1:
+                return None, (), (), "incomplete_savings_schedule"
+            winner, reason, applied = _resolve_one(resolver, index, candidates[0], target)
+            rules.extend(applied)
+            if winner is None or (winner.url, winner.section, winner.dates.effective_on) != key:
+                return None, (), tuple(rules), reason if winner is None else "mixed_savings_schedule"
+            winners.append(winner)
+    if "highest" in lower:
+        best = max(winners, key=lambda c: c.value.value)
+        tier = _qualifiers(best)["tier"]
+        if not tier.endswith("+"):
+            return None, (), tuple(rules), "highest_tier_not_open_ended"
+        return (f"The highest published {subject.title()} {measure.upper()} is {best.value.raw} "
+                f"for balances of {tier}."), (best,), tuple(dict.fromkeys(rules)), "accepted"
+    tier = next(iter(tiers))
+    facts = ", ".join(f"{c.value.raw} {c.identity.measure.replace('_', ' ')}" for c in winners)
+    return (f"Published {subject.title()} rates for balance tier {tier}: {facts}.",
+            tuple(winners), tuple(dict.fromkeys(rules)), "accepted")
 
 
 def propose(question, spec, index, resolver: TemporalResolver, existing_answer, as_of=None):
