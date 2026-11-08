@@ -10,6 +10,7 @@ import re
 import sys
 from collections import Counter, defaultdict, deque
 from dataclasses import replace
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import urlparse
@@ -595,12 +596,93 @@ def compose_answer(spec, selection):
     return Answer(text, sources)
 
 
+def _promotion_conditions(record, index):
+    """Render only mortgage conditions verified in the selected source notes."""
+    if not record.supporting_claims or any(
+            c.identity.family != "mortgage" or c.identity.measure != "interest_rate"
+            for c in record.supporting_claims):
+        return None
+    notes = " ".join(record.source_notes)
+    if not ("rates may be as low as quoted rates" in notes.lower()
+            and "all loans are subject to approval" in notes.lower()
+            and "subject to change" in notes.lower()
+            and re.search(r"owner[- ]occupied", notes, re.I)):
+        return None
+    score = re.search(r"minimum credit score of\s+(\d{3})", notes, re.I)
+    ltv = re.search(r"(\d{1,3})\s*%\s*loan[- ]to[- ]value", notes, re.I)
+    lock = re.search(r"(\d{1,3})[- ]day rate lock and expire at ([^.]+?) daily", notes, re.I)
+    if not all((score, ltv, lock)):
+        return None
+    points = set()
+    for claim in record.supporting_claims:
+        page = index.pages.get(claim.url)
+        if page is None:
+            return None
+        lines = page.markdown.splitlines()
+        pos = claim.line - 1
+        if not 0 <= pos < len(lines) or lines[pos].strip() != claim.evidence:
+            return None
+        start = pos
+        while start and lines[start - 1].strip().startswith("|"):
+            start -= 1
+        headers = [cell.strip().lower() for cell in lines[start].strip().strip("|").split("|")]
+        cells = [cell.strip() for cell in lines[pos].strip().strip("|").split("|")]
+        if len(headers) != len(cells) or headers.count("points") != 1:
+            return None
+        raw = cells[headers.index("points")]
+        if not re.fullmatch(r"\d+(?:\.\d+)?%?", raw):
+            return None
+        try:
+            points.add(Decimal(raw.rstrip("%")))
+        except InvalidOperation:
+            return None
+    if len(points) != 1:
+        return None
+    point = next(iter(points))
+    return (f"Quoted rates have {point:g} points and assume an owner-occupied residence, "
+            f"a minimum credit score of {score.group(1)}, {ltv.group(1)}% loan-to-value, "
+            f"and a {lock.group(1)}-day rate lock expiring at {lock.group(2)} daily. "
+            "Loans are subject to approval; rates and terms can change.")
+
+
+def _verified_promoted_answer(record, existing, index):
+    """Build and check the final Answer after the shadow validator approves it."""
+    if (not record.eligible or record.classification != "IMPROVEMENT"
+            or record.snapshot_id != index.snapshot_id or not record.proposed_citations
+            or len(record.proposed_citations) != len(record.supporting_claims)):
+        return None, "promotion_gate_closed"
+    if classify(record, existing, index)[0] != "IMPROVEMENT":
+        return None, "final_evidence_check_failed"
+    conditions = _promotion_conditions(record, index)
+    if conditions is None or not record.proposed_answer or " Conditions: " not in record.proposed_answer:
+        return None, "unsupported_rendered_conditions"
+    core = record.proposed_answer.split(" Conditions: ", 1)[0]
+    sources = []
+    for claim, (url, quote) in zip(record.supporting_claims, record.proposed_citations):
+        page = index.pages.get(url)
+        if (page is None or url != claim.url or quote != claim.evidence
+                or quote not in page.markdown or claim.snapshot_id != index.snapshot_id):
+            return None, "unverified_promotion_citation"
+        sources.append(Source(url, index.snapshot_id, quote))
+    rendered = core + " " + conditions
+    candidate = Answer(rendered, sources, confident=True)
+    # The verified core contains every requested fact and row association.
+    # The suffix is assembled only from checked row/footnote fields above.
+    if (candidate.text != core + " " + _promotion_conditions(record, index)
+            or candidate.text.split(" Quoted rates have ", 1)[0] != core
+            or tuple((s.url, s.snapshot_id, s.quote) for s in candidate.sources) !=
+            tuple((url, index.snapshot_id, quote) for url, quote in record.proposed_citations)):
+        return None, "rendered_answer_mismatch"
+    return candidate, "verified_factual_improvement"
+
+
 class LexicalKnowledge:
     def __init__(self):
         self.snapshots = []
         self.unresolved_evidence = {}
         self.shadow_diagnostics = deque(maxlen=64)
         self.shadow_errors = deque(maxlen=64)
+        self.promotion_diagnostics = deque(maxlen=64)
         self._shadow_resolver = None
 
     def ingest(self, snapshot):
@@ -625,8 +707,17 @@ class LexicalKnowledge:
                     status, reason = classify(record, answer, index)
                     record = replace(record, classification=status, classification_reason=reason)
                 self.shadow_diagnostics.append(record)
+                if record.classification == "IMPROVEMENT":
+                    promoted, reason = _verified_promoted_answer(record, answer, index)
+                    if promoted is not None:
+                        self.promotion_diagnostics.append((index.snapshot_id, question, "PROMOTED", reason))
+                        return promoted
+                else:
+                    reason = record.classification_reason or record.reason
+                self.promotion_diagnostics.append((index.snapshot_id, question, "FALLBACK", reason))
             except Exception as exc:
                 self.shadow_errors.append((index.snapshot_id, type(exc).__name__, str(exc)[:160]))
+                self.promotion_diagnostics.append((index.snapshot_id, question, "FALLBACK", "validation_error"))
         return answer
 
     def _answer_existing(self, question, as_of=None):

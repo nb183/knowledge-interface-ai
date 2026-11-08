@@ -1,6 +1,10 @@
 # Project plan
 
-## Current state: Phase 4B implemented, awaiting review
+## Current state: Phase 4F implemented, awaiting review
+
+Phase 4F conservatively activates a verified structured mortgage-rate proposal only after the Phase 4E validator classifies it as an improvement. The final answer preserves the verified rate/term/tier schedule, summarizes source-supported eligibility and rate-lock conditions, and cites each selected-snapshot row. Other fact types, incomplete evidence, ambiguous requests, and already-correct lexical answers keep the existing answer. `conflicts()` and resolver rules are unchanged.
+
+The official public run immediately before activation scored **0.7124 QA** (40 questions, 0.07 s p50 / 0.18 s p95, 13.6 s ingest). After activation it scored **0.7388 QA** (**+0.0264**), with **0.08 s p50 / 0.19 s p95**, **13.2 s ingest**, zero errors and stale-value trap hits, and 1.0 consistency. Only `dup-009` changed (0→0.85); the other 39 answer objects and scores remained identical. Stale-trap category score rose from 0.5286 to 0.6500; all other category scores were unchanged. One of 40 public questions was promoted. Of the 39 fallbacks, three were verified no-ops; the rest were unsupported or insufficient requests. A direct comparison found the same 84 `conflicts()` entries before and after. Fifty-five focused test functions passed. The public kit has no conflict gold set, and hidden-set impact remains unmeasured. No Phase 4F commit or push has been made.
 
 Phase 4A is committed as `c7955d6`. Phase 4B adds a standalone resolver in `solution/resolver.py`; the existing answer and conflict methods remain unchanged. The resolver filters by selected snapshot first, matches typed qualifiers, distinguishes schedule succession from same-period disagreement, and retains competing claims with applied rules and provenance. It does not connect to member-facing answers or the contract conflict output.
 

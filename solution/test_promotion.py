@@ -3,7 +3,7 @@ from dataclasses import replace
 
 from harness.contract import Answer, Page, Snapshot
 from solution.promotion import classify
-from solution.solution import build
+from solution.solution import _verified_promoted_answer, build
 
 
 def _page(body):
@@ -14,15 +14,19 @@ def _mortgage_system():
     body = ("# Rates\n## Home Loans - Purchase\n| Program | Rate | Points | APR |\n| --- | --- | --- | --- |\n"
             "| Purchase: 30-Year Fixed Conventional $100,000 or less | 7.13% | 0 | 7.27% |\n"
             "| Purchase: 30-Year Fixed Conventional $200,000 or less | 7.25% | 0 | 7.34% |\n"
-            "Rates are effective as of 09/25/2026.\n"
-            "Rates assume owner-occupied property and a minimum credit score of 760.\n"
-            "Rate quotes reflect a 30-day rate lock and expire daily.\n"
+            "Rates are effective as of 09/25/2026. Rates may be as low as quoted rates. "
+            "All loans are subject to approval. Rates, terms, and conditions are subject to change.\n"
+            "Rates assume owner-occupied property and a minimum credit score of 760 "
+            "and 75% loan-to-value.\n"
+            "Rate quotes reflect a 30-day rate lock and expire at 3 pm Central Time daily.\n"
             "## Home Loans - Refinance\n| Program | Rate | Points | APR |\n| --- | --- | --- | --- |\n"
             "| Refinance: 30-Year Fixed Conventional $100,000 or less | 7.13% | 0 | 7.28% |\n"
             "| Refinance: 30-Year Fixed Conventional $200,000 or less | 7.25% | 0 | 7.35% |\n"
-            "Rates are effective as of 09/25/2026.\n"
-            "Rates assume owner-occupied property and a minimum credit score of 760.\n"
-            "Rate quotes reflect a 30-day rate lock and expire daily.\n")
+            "Rates are effective as of 09/25/2026. Rates may be as low as quoted rates. "
+            "All loans are subject to approval. Rates, terms, and conditions are subject to change.\n"
+            "Rates assume owner-occupied property and a minimum credit score of 760 "
+            "and 75% loan-to-value.\n"
+            "Rate quotes reflect a 30-day rate lock and expire at 3 pm Central Time daily.\n")
     ks = build()
     ks.ingest(Snapshot("one", "2026-09-28", [_page(body)]))
     ks.answer("What is the interest rate for a 30-year mortgage?")
@@ -131,8 +135,8 @@ def test_partial_schedule_mixed_transactions_and_dates_are_unsafe():
     assert classify(mixed, abstention, index)[0] == "UNSAFE"
     later = _page(index.pages["https://example.test/rates"].markdown.replace(
         "## Home Loans - Refinance", "## Home Loans - Refinance").replace(
-        "Rates are effective as of 09/25/2026.\nRates assume owner-occupied property and a minimum credit score of 760.\n",
-        "Rates are effective as of 09/26/2026.\nRates assume owner-occupied property and a minimum credit score of 760.\n", 1))
+        "Rates are effective as of 09/25/2026. Rates may be as low as quoted rates.",
+        "Rates are effective as of 09/26/2026. Rates may be as low as quoted rates.", 1))
     changed = build()
     changed.ingest(Snapshot("one", "2026-09-28", [later]))
     changed.answer("What is the interest rate for a 30-year mortgage?")
@@ -144,10 +148,11 @@ def test_conflicts_conditions_citations_and_historical_snapshot_are_checked():
     index = ks.snapshots[-1]
     abstention = Answer("I don't know.", confident=False)
     omitted = replace(record, proposed_answer=record.proposed_answer.replace(
-        "Rates assume owner-occupied property and a minimum credit score of 760.", ""))
+        "Rates assume owner-occupied property and a minimum credit score of 760 "
+        "and 75% loan-to-value.", ""))
     assert classify(omitted, abstention, index)[0] == "UNSAFE"
     omitted_lock = replace(record, proposed_answer=record.proposed_answer.replace(
-        "Rate quotes reflect a 30-day rate lock and expire daily.", ""))
+        "Rate quotes reflect a 30-day rate lock and expire at 3 pm Central Time daily.", ""))
     assert classify(omitted_lock, abstention, index)[0] == "UNSAFE"
     bad_url = replace(record, proposed_citations=(("https://example.test/wrong", record.proposed_citations[0][1]),)
                       + record.proposed_citations[1:])
@@ -195,3 +200,78 @@ def test_specific_loan_amount_requires_correct_interval():
                                             (key, value) for key, value in record.requested))
     assert classify(wrong, Answer("I don't know.", confident=False), index) == (
         "UNSAFE", "wrong_loan_amount_tier")
+
+
+def test_verified_mortgage_promotion_renders_only_supported_facts_and_citations():
+    ks, record = _mortgage_system()
+    ks._answer_existing = lambda question, as_of=None: Answer("I don't know.", confident=False)
+    answer = ks.answer(record.question)
+    assert answer.confident and ks.promotion_diagnostics[-1][2] == "PROMOTED"
+    assert "7.13%" in answer.text and "7.25%" in answer.text
+    assert "7.27%" not in answer.text and "7.34%" not in answer.text
+    assert "over $100,000 and up to $200,000" in answer.text
+    assert "0 points" in answer.text and "minimum credit score of 760" in answer.text
+    assert "75% loan-to-value" in answer.text and "30-day rate lock" in answer.text
+    assert "subject to approval" in answer.text
+    assert len(answer.sources) == len(ks.shadow_diagnostics[-1].supporting_claims) == 4
+    assert all(s.url == "https://example.test/rates" and s.snapshot_id == "one" and
+               s.quote in ks.snapshots[-1].pages[s.url].markdown for s in answer.sources)
+    assert ks.answer(record.question) == answer
+
+
+def test_promotion_gate_revalidates_final_text_and_citations():
+    ks, record = _mortgage_system()
+    index = ks.snapshots[-1]
+    abstention = Answer("I don't know.", confident=False)
+    verified = replace(record, classification="IMPROVEMENT")
+    bad_rate = replace(verified, proposed_answer=verified.proposed_answer.replace("7.13%", "7.99%"))
+    assert _verified_promoted_answer(bad_rate, abstention, index)[0] is None
+    bad_source = replace(verified, proposed_citations=(("https://example.test/wrong",
+                    verified.proposed_citations[0][1]),) + verified.proposed_citations[1:])
+    assert _verified_promoted_answer(bad_source, abstention, index)[0] is None
+    assert _verified_promoted_answer(replace(record, classification="NO_OP"), abstention, index)[0] is None
+
+
+def test_promotion_falls_back_for_dual_measures_partial_schedules_and_conflicts():
+    ks, record = _mortgage_system()
+    ks._answer_existing = lambda question, as_of=None: Answer("I don't know.", confident=False)
+    question = "What are the interest rate and APR for a purchase 30-year mortgage?"
+    assert ks.answer(question) == Answer("I don't know.", confident=False)
+    assert ks.promotion_diagnostics[-1][2] == "FALLBACK"
+    index = ks.snapshots[-1]
+    incomplete = index.pages["https://example.test/rates"].markdown.replace(
+        "| Refinance: 30-Year Fixed Conventional $200,000 or less | 7.25% | 0 | 7.35% |\n", "")
+    partial = build()
+    partial.ingest(Snapshot("one", "2026-09-28", [_page(incomplete)]))
+    partial._answer_existing = ks._answer_existing
+    assert partial.answer(record.question) == Answer("I don't know.", confident=False)
+    assert partial.promotion_diagnostics[-1][2] == "FALLBACK"
+    conflicting = build()
+    other = index.pages["https://example.test/rates"].markdown.replace(
+        "| Purchase: 30-Year Fixed Conventional $100,000 or less | 7.13% | 0 | 7.27% |",
+        "| Purchase: 30-Year Fixed Conventional $100,000 or less | 7.50% | 0 | 7.27% |")
+    conflicting.ingest(Snapshot("one", "2026-09-28", [index.pages["https://example.test/rates"],
+                    Page("https://example.test/other", "Rates", other, "2026-09-28T00:00:00Z")]))
+    conflicting._answer_existing = ks._answer_existing
+    assert conflicting.answer(record.question) == Answer("I don't know.", confident=False)
+    assert conflicting.promotion_diagnostics[-1][2] == "FALLBACK"
+
+
+def test_promoted_historical_answer_uses_only_selected_snapshot():
+    ks, _ = _mortgage_system()
+    body = ks.snapshots[-1].pages["https://example.test/rates"].markdown
+    old = build()
+    old_body = body.replace("09/25/2026", "04/22/2026").replace("7.13%", "6.13%")
+    old.ingest(Snapshot("old", "2026-05-01", [Page("https://example.test/old", "Rates", old_body,
+                                                   "2026-05-01T00:00:00Z")]))
+    old.ingest(Snapshot("new", "2026-09-28", [Page("https://example.test/new", "Rates", body,
+                                                    "2026-09-28T00:00:00Z")]))
+    old._answer_existing = lambda question, as_of=None: Answer("I don't know.", confident=False)
+    question = "What is the interest rate for a 30-year mortgage?"
+    historical = old.answer(question, as_of="2026-05-01")
+    current = old.answer(question)
+    assert historical.confident and current.confident
+    assert "6.13%" in historical.text and "7.13%" not in historical.text
+    assert "7.13%" in current.text and "6.13%" not in current.text
+    assert all(s.snapshot_id == "old" and s.url == "https://example.test/old" for s in historical.sources)
+    assert all(s.snapshot_id == "new" and s.url == "https://example.test/new" for s in current.sources)
