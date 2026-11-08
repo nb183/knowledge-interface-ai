@@ -1,6 +1,10 @@
 # Project plan
 
-## Current state: Phase 3B implemented, awaiting review
+## Current state: Phase 4B implemented, awaiting review
+
+Phase 4A is committed as `c7955d6`. Phase 4B adds a standalone resolver in `solution/resolver.py`; the existing answer and conflict methods remain unchanged. The resolver filters by selected snapshot first, matches typed qualifiers, distinguishes schedule succession from same-period disagreement, and retains competing claims with applied rules and provenance. It does not connect to member-facing answers or the contract conflict output.
+
+The Phase 4B public evaluation remains **0.7124 QA**, with all 40 answer objects and question scores identical to Phase 4A, **1.0 consistency**, zero errors and stale-value trap hits, **0.07 s p50**, **0.17 s p95**, and **15.9 s ingest**. Synthetic focused tests pass. On 2,565 extracted claims, resolver construction took approximately **0.000008 s** and retained approximately **0.3 KiB**; a 100-call latest-snapshot mortgage sample measured **0.651 ms p50 / 0.657 ms p95** per lookup under `tracemalloc`, and discovery took **0.15 s**. These are local measurements, not production guarantees. The current lexical `conflicts()` output is unchanged and remains unscored without a public conflict gold set.
 
 The initial deterministic lexical submission is in `solution/`. The Phase 1 public baseline was **0.5044 QA** on 40 questions, with **0.03 s p50**, **0.09 s p95**, **1.0 consistency**, zero runtime errors, and zero stale-trap hits. The official rerun before Phase 3A reproduced that baseline. These are public-kit measurements, not hidden-set or production results. The public run did not include a conflict gold file.
 
