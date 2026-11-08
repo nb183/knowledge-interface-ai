@@ -52,6 +52,55 @@ def normalized_tier(text: str) -> str:
     return re.sub(r"\s+", "", normalize(text).replace(",", "").replace("–", "-"))
 
 
+def normalized_amount(text: str) -> str:
+    """Use one identity for amounts printed as $1,000 and $1,000.00."""
+    match = re.fullmatch(r"\$\s*([\d,]+(?:\.\d{1,2})?)", text.strip())
+    return format(Decimal(match.group(1).replace(",", "")).normalize(), "f") if match else ""
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractionDiagnostic:
+    url: str
+    line: int
+    reason: str
+    evidence: str
+
+
+def _rate_column(header: str) -> tuple[str, str] | None:
+    """Identify one measure and its explicit time condition, or decline the cell."""
+    label = normalize(header)
+    measure_words = (("annual percentage yield", "apy"), ("apy", "apy"),
+                     ("annual percentage rate", "apr"), ("apr", "apr"),
+                     ("dividend rate", "dividend_rate"), ("interest rate", "interest_rate"))
+    kinds = {kind for word, kind in measure_words
+             if re.search(r"\b" + re.escape(word) + r"\b", label)}
+    if re.search(r"\brate\s*[/&+]", label) and kinds:
+        return None
+    if not kinds and re.fullmatch(r"rate(?:\s*\(?as low as\)?)?", label):
+        kinds = {"interest_rate"}
+    if len(kinds) != 1:
+        return None
+    conditions = []
+    period = re.search(r"\b(?:first|initial|1st)\s+\d+\s+months?\b", label)
+    if period:
+        conditions.append(period.group())
+    if "after promotional period" in label:
+        conditions.append("after promotional period")
+    if "as low as" in label:
+        conditions.append("as low as")
+    remainder = label
+    for word, _ in measure_words:
+        remainder = re.sub(r"\b" + re.escape(word) + r"\b", " ", remainder)
+    if kinds == {"interest_rate"}:
+        remainder = re.sub(r"\brate\b", " ", remainder)
+    for condition in conditions:
+        remainder = remainder.replace(condition, " ")
+    remainder = re.sub(r"\bfor\b|[\d\s()*:.-]", "", remainder)
+    if remainder:
+        return None
+    return kinds.pop(), "; ".join(conditions)
+
+
 @dataclass(frozen=True, slots=True)
 class FactIdentity:
     family: str
@@ -164,7 +213,8 @@ def _claim(identity: FactIdentity, value: TypedValue, dates: ClaimDates,
                  dates, snapshot_id, page.url, page.title, section, evidence, line)
 
 
-def extract_claims(page, snapshot_id: str, snapshot_on: str) -> tuple[Claim, ...]:
+def extract_claims(page, snapshot_id: str, snapshot_on: str,
+                   diagnostics: list[ExtractionDiagnostic] | None = None) -> tuple[Claim, ...]:
     """Extract structured rate rows, branch hours/counts, and dated VTO counts."""
     lines = page.markdown.splitlines()
     published = _publication(lines)
@@ -195,14 +245,38 @@ def extract_claims(page, snapshot_id: str, snapshot_on: str) -> tuple[Claim, ...
             effective, expires = _table_dates(lines, i)
             if len(table) >= 3:
                 headers = [normalize(x) for x in table[0][2]]
+                separator = table[1][2]
+                if (len(separator) != len(headers) or not all(re.fullmatch(r":?-{3,}:?", x.strip()) for x in separator)
+                        or any(not x for x in headers)):
+                    if diagnostics is not None:
+                        diagnostics.append(ExtractionDiagnostic(page.url, table[0][0], "invalid_table_header", table[0][1]))
+                    continue
+                rate_columns = [_rate_column(x) for x in headers]
+                if len(set(headers)) != len(headers):
+                    if diagnostics is not None:
+                        diagnostics.append(ExtractionDiagnostic(page.url, table[0][0], "duplicate_table_header", table[0][1]))
+                    continue
+                if not any(rate_columns):
+                    continue
                 for number, evidence, cells in table[2:]:
                     if len(cells) != len(headers) or all(not x for x in cells):
+                        if diagnostics is not None:
+                            diagnostics.append(ExtractionDiagnostic(page.url, number, "irregular_table_row", evidence))
                         continue
                     row = dict(zip(headers, cells))
-                    subject = row.get("account type") or row.get("certificate") or row.get("card type") or row.get("program") or row.get("term") or ""
+                    inferred_deposit = (section_label if (row.get("balance tier") or row.get("balance"))
+                                        and re.search(r"\b(?:savings?|checking|money market|choice|club|account)\b",
+                                                      section_label)
+                                        and not re.search(r"\b(?:rates?|select an option)\b", section_label) else "")
+                    subject = (row.get("account type") or row.get("ira type") or row.get("certificate")
+                               or row.get("card type") or row.get("program") or row.get("term")
+                               or inferred_deposit or "")
                     if not subject:
                         continue
                     lower = normalize(subject + " " + section + " " + section_label + " " + page.title)
+                    ira_type = next((kind for kind in ("roth", "traditional", "sep", "simple")
+                                     if re.match(r"^" + kind + r"\s*:", normalize(subject))), "")
+                    is_ira = bool(ira_type or "ira account rates" in section or "iras" in section_label)
                     if "mortgage" in lower or "home loan" in lower or re.search(r"\b\d{1,3}-year fixed\b", lower):
                         family = "mortgage"
                         loan_type = next((kind for kind in ("conventional", "fha", "va", "usda", "jumbo")
@@ -210,23 +284,38 @@ def extract_claims(page, snapshot_id: str, snapshot_on: str) -> tuple[Claim, ...
                         product = "mortgage"
                     elif "certificate" in lower or re.search(r"\bcd\b", lower):
                         family = "certificate"
-                        product = "certificate"
+                        product = "ira certificate" if is_ira else "certificate"
+                    elif is_ira:
+                        family = "certificate"
+                        product = "ira certificate"
                     elif "visa" in lower or "credit card" in lower:
                         family = "card"
                         product = subject
-                    elif "savings" in lower or "money market" in lower or "checking" in lower:
+                    elif ("savings" in lower or "money market" in lower or "checking" in lower
+                          or (row.get("balance tier") or row.get("balance")) and
+                          any(kind and kind[0] in ("dividend_rate", "apy") for kind in rate_columns)):
                         family = "deposit"
                         product = subject if row.get("account type") else section_label
+                        if not product or product in ("select an option below", "regular", "special"):
+                            if diagnostics is not None:
+                                diagnostics.append(ExtractionDiagnostic(page.url, number, "unknown_deposit_product", evidence))
+                            continue
                     else:
                         continue
-                    term = re.search(r"\b\d{1,3}[- ](?:month|year)\b|\b\d{1,2}/\d{1,2}\b", lower)
-                    qualifiers = {"tier": normalized_tier(row.get("balance tier", "") or
+                    term = re.search(r"\b\d{1,3}[- ](?:months?|years?)\b|\b\d{1,2}/\d{1,2}\b", normalize(subject))
+                    term_value = re.sub(r"\b(months|years)\b", lambda m: m.group()[:-1], term.group().replace("-", " ")) if term else ""
+                    minimum = normalized_amount(row.get("min. to earn", "") or row.get("minimum to earn", ""))
+                    qualifiers = {"tier": normalized_tier(row.get("balance tier", "") or row.get("balance", "") or
                                                              (re.search(r"\$[\d,]+\s+or\s+less", subject, re.I) or [""])[0]),
-                                  "term": term.group(0).replace("-", " ") if term else "",
+                                  "term": term_value,
                                   "transaction": "refinance" if "refinance" in normalize(subject) else
                                                  ("purchase" if "purchase" in normalize(subject) else ""),
                                   "program": "special" if re.search(r"\b(relief|special|promotion)\b", lower) else "standard",
                                   "variant": normalize(subject) if family == "certificate" else "",
+                                  "account_type": ira_type if is_ira else "",
+                                  "size": "jumbo" if family == "certificate" and re.search(r"\bjumbo\b", normalize(subject)) else
+                                          "ordinary" if family == "certificate" else "",
+                                  "min_deposit": minimum if family == "certificate" else "",
                                   "loan_type": loan_type if family == "mortgage" else "",
                                   "rate_structure": ("arm" if re.search(r"\barm\b|adjustable", lower) else
                                                      "fixed" if "fixed" in normalize(subject) else "")
@@ -235,26 +324,41 @@ def extract_claims(page, snapshot_id: str, snapshot_on: str) -> tuple[Claim, ...
                                            ("personal" if "/personal" in page.url else "")}
                     # The product name carries card/deposit identity; qualifiers
                     # keep tiers and loan terms distinct within that product.
-                    for header, cell in row.items():
-                        measure = ("apy" if "annual percentage yield" in header or header == "apy" else
-                                   "apr" if header == "apr" else
-                                   "dividend_rate" if "dividend rate" in header else
-                                   "interest_rate" if header == "rate" else "")
-                        if not measure:
+                    for col, (header, cell) in enumerate(zip(headers, cells)):
+                        column = rate_columns[col]
+                        if column is None:
+                            if PERCENT_RE.search(cell) and diagnostics is not None:
+                                diagnostics.append(ExtractionDiagnostic(page.url, number, "ambiguous_rate_column", evidence))
                             continue
-                        match = PERCENT_RE.search(cell)
-                        if not match:
+                        measure, condition = column
+                        if family in ("deposit", "certificate") and measure == "apr":
+                            if diagnostics is not None:
+                                diagnostics.append(ExtractionDiagnostic(page.url, number, "unsupported_measure_for_product", evidence))
                             continue
-                        value = _number(match.group(0), "percent")
+                        matches = list(PERCENT_RE.finditer(cell))
+                        if not cell.strip():
+                            if diagnostics is not None:
+                                diagnostics.append(ExtractionDiagnostic(page.url, number, "empty_rate_cell", evidence))
+                            continue
+                        range_cell = (len(matches) == 2 and bool(re.fullmatch(
+                            r"\s*\d+(?:\.\d+)?\s*%\s*[-–]\s*\d+(?:\.\d+)?\s*%\d*\s*", cell)))
+                        if len(matches) != 1 and not range_cell:
+                            if diagnostics is not None:
+                                diagnostics.append(ExtractionDiagnostic(page.url, number, "ambiguous_rate_cell", evidence))
+                            continue
+                        value = (TypedValue("percent_range",
+                                            "-".join(m.group(1) for m in matches), "%", cell.strip())
+                                 if range_cell else _number(matches[0].group(0), "percent"))
                         if value:
                             dates = ClaimDates(base.snapshot_on, base.fetched_at, base.published_on,
                                                effective, expires)
-                            identity = FactIdentity.make(family, product, measure, **qualifiers)
+                            identity = FactIdentity.make(family, product, measure, **qualifiers,
+                                                         rate_period=condition)
                             claims.append(_claim(identity, value, dates, snapshot_id, page,
                                                  section + (" > " + section_label if section_label else ""),
-                                                 evidence, number, header))
+                                                 evidence, number, f"{col}:{header}"))
             continue
-        if line and not line.startswith(("[", "!", "* *")) and len(line) < 75 and not re.search(r"[.!?]$", line):
+        if line and not line.startswith(("#", "[", "!", "* *")) and len(line) < 75 and not re.search(r"[.!?]$", line):
             # Plain labels often delimit product tables on the supplied rate pages.
             if not re.search(r"\d", line) and not line.startswith("-"):
                 section_label = normalize(line)
@@ -314,8 +418,10 @@ class FactIndex:
 
     def __init__(self, snapshot):
         self.snapshot_id = snapshot.snapshot_id
+        diagnostics: list[ExtractionDiagnostic] = []
         self.claims = tuple(claim for page in snapshot.pages
-                            for claim in extract_claims(page, snapshot.snapshot_id, snapshot.taken_on))
+                            for claim in extract_claims(page, snapshot.snapshot_id, snapshot.taken_on, diagnostics))
+        self.diagnostics = tuple(diagnostics)
         identities = {}
         families = {}
         for claim in self.claims:

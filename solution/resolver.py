@@ -53,6 +53,19 @@ def qualifier_match(request: FactIdentity, candidate: FactIdentity) -> str:
     return "compatible_unknown" if unknown else "exact"
 
 
+def _complete_conflict_identity(identity: FactIdentity) -> bool:
+    """Do not confirm a contradiction where a structured product dimension is absent."""
+    qualifiers = dict(identity.qualifiers)
+    if identity.family == "certificate":
+        required = {"term", "size", "min_deposit"}
+        if identity.subject == "ira certificate":
+            required.add("account_type")
+        return required <= qualifiers.keys()
+    if identity.family == "mortgage":
+        return {"term", "transaction"} <= qualifiers.keys()
+    return bool(identity.subject and identity.measure)
+
+
 def authority(claim: Claim) -> tuple[int, str]:
     """Rank evidence roles from structure, not individual URLs or values."""
     family = claim.identity.family
@@ -202,6 +215,38 @@ class TemporalResolver:
         result = []
         for identity in index.by_identity:
             decision = self.resolve(FactPattern(identity), target_date, sid)
-            result.extend(decision.conflicts)
+            result.extend(c for c in decision.conflicts
+                          if all(_complete_conflict_identity(claim.identity) for claim in c.claims))
         # Several exact identities may produce the same candidate; retain one.
         return tuple({tuple(sorted(c.id for c in item.claims)): item for item in result}.values())
+
+    def discover_review_candidates(self, selected_snapshot: str | FactIndex, target_date: str):
+        """Keep compatible but unproven value pairs separate from confirmed conflicts."""
+        sid = selected_snapshot if isinstance(selected_snapshot, str) else selected_snapshot.snapshot_id
+        index = self.indexes[sid]
+        groups = defaultdict(list)
+        for claim in index.claims:
+            dates = claim.dates
+            if ((dates.effective_on and dates.effective_on > target_date)
+                    or (dates.expires_on and dates.expires_on < target_date)
+                    or (dates.published_on and dates.published_on > target_date)):
+                continue
+            key = (claim.identity.family, claim.identity.subject, claim.identity.measure)
+            groups[key].append(claim)
+        result = []
+        for (family, subject, measure), claims in groups.items():
+            claims = _deduplicate(claims)
+            for pos, left in enumerate(claims):
+                for right in claims[pos + 1:]:
+                    if _value_key(left) == _value_key(right):
+                        continue
+                    match = qualifier_match(left.identity, right.identity)
+                    if match == "incompatible":
+                        continue
+                    if match == "exact" and all(_complete_conflict_identity(c.identity) for c in (left, right)):
+                        continue
+                    result.append(ConflictCandidate(
+                        f"{family}: {subject} {measure}", (left.value.raw, right.value.raw),
+                        (left, right), "unknown", None,
+                        "missing_qualifier" if match == "compatible_unknown" else "incomplete_fact_identity"))
+        return tuple(result)

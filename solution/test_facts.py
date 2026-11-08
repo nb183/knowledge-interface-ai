@@ -1,4 +1,6 @@
 """Synthetic tests for the Phase 4A inventory; no supplied snapshots required."""
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from solution.facts import (FactIdentity, FactIndex, extract_claims, parse_date,
@@ -142,3 +144,112 @@ def test_fact_index_is_deterministic_and_snapshot_isolated():
     assert a.claims[0].dates.snapshot_on == "2026-01-01"
     assert b.claims[0].dates.snapshot_on == "2026-03-01"
     assert a.get(FactIdentity.make("card", "visa", "apr")) == ()
+
+
+def test_ira_identity_keeps_account_term_size_and_minimum_distinct():
+    body = ("# IRA Account Rates\nSpecial IRAs\n"
+            "| Term | Dividend Rate | APY | Min. to Earn |\n| --- | --- | --- | --- |\n"
+            "| Roth: 10 Month Fixed Jumbo Special | 3.80% | 3.90% | $100,000 |\n"
+            "| Roth: 10 Month Fixed Special | 3.70% | 3.80% | $1,000.00 |\n"
+            "| Traditional: 10 Month Fixed Special | 3.60% | 3.70% | $1,000 |\n"
+            "| Roth: 25 Month Fixed Special | 3.50% | 3.60% | $1,000 |\n")
+    rates = [c for c in claims(body) if c.identity.measure == "dividend_rate"]
+    assert len(rates) == len({c.identity for c in rates}) == 4
+    assert {dict(c.identity.qualifiers)["min_deposit"] for c in rates} == {"100000", "1000"}
+    assert {dict(c.identity.qualifiers)["account_type"] for c in rates} == {"roth", "traditional"}
+    assert {dict(c.identity.qualifiers)["term"] for c in rates} == {"10 month", "25 month"}
+    assert {dict(c.identity.qualifiers)["size"] for c in rates} == {"jumbo", "ordinary"}
+
+
+def test_rate_columns_keep_measure_and_promotion_period_distinct():
+    body = ("# Savings Rates\n| Account Type | Balance Tier | Dividend Rate for 1st 6 Months | "
+            "Annual Percentage Yield (APY) for 1st 6 Months | Dividend Rate After Promotional Period | "
+            "Annual Percentage Yield (APY) After Promotional Period |\n"
+            "| --- | --- | --- | --- | --- | --- |\n"
+            "| Achieve Money Market | $25,000-$99,999.99 | 4.00% | 3.66% | 3.20% | 3.25% |\n")
+    items = claims(body)
+    assert len(items) == len({c.identity for c in items}) == 4
+    assert {(c.identity.measure, dict(c.identity.qualifiers)["rate_period"]) for c in items} == {
+        ("dividend_rate", "1st 6 months"), ("apy", "1st 6 months"),
+        ("dividend_rate", "after promotional period"), ("apy", "after promotional period")}
+    assert all(c.evidence.startswith("| Achieve Money Market") for c in items)
+
+
+def test_reused_balance_tier_keeps_savings_and_checking_products_separate():
+    body = ("# Rates\n| Account Type | Balance Tier | Dividend Rate | APY |\n"
+            "| --- | --- | --- | --- |\n"
+            "| Share Savings | $25,000+ | 0.20% | 0.20% |\n"
+            "| 1st Rate Checking | $25,000+ | 0.10% | 0.10% |\n"
+            "Investor's Choice\n| Balance Tier | Dividend Rate | APY |\n"
+            "| --- | --- | --- |\n| $25,000+ | 0.35% | 0.35% |\n")
+    items = claims(body)
+    assert len(items) == 6
+    assert {c.identity.subject for c in items} == {
+        "share savings", "1st rate checking", "investor's choice"}
+    assert len({c.identity for c in items}) == 6
+
+
+def test_certificate_same_term_but_different_minimum_is_distinct():
+    body = ("# Certificate Rates\n| Certificate | APY | Min. to Earn |\n"
+            "| --- | --- | --- |\n"
+            "| 10 Month Fixed Certificate | 3.50% | $1,000 |\n"
+            "| 10 Month Fixed Certificate | 3.75% | $5,000.00 |\n")
+    items = claims(body)
+    assert len(items) == 2 and items[0].identity != items[1].identity
+    assert {dict(c.identity.qualifiers)["min_deposit"] for c in items} == {"1000", "5000"}
+
+
+def test_labelled_card_apr_range_is_one_typed_value():
+    body = ("# Credit Card Rates\n| Card Type | APR |\n| --- | --- |\n"
+            "| Platinum Visa | 12.50% – 19.50%2 |\n")
+    items = claims(body)
+    assert len(items) == 1
+    assert items[0].identity.measure == "apr"
+    assert items[0].value.kind == "percent_range"
+    assert items[0].value.value == "12.50-19.50"
+    assert items[0].value.raw == "12.50% – 19.50%2"
+
+
+def test_irregular_empty_and_ambiguous_rate_cells_keep_diagnostics():
+    body = ("# Home Rates\n| Program | Rate / APR | APR |\n| --- | --- | --- |\n"
+            "| Purchase: 30-Year Fixed Conventional | 2.00% | |\n"
+            "| Purchase: 20-Year Fixed Conventional | 3.00% | 3.10% | extra |\n"
+            "| Purchase: 15-Year Fixed Conventional | 2.00% | |\n")
+    notes = []
+    assert extract_claims(page(body), "one", "2026-09-28", notes) == ()
+    assert {note.reason for note in notes} == {
+        "ambiguous_rate_column", "empty_rate_cell", "irregular_table_row"}
+    assert all(note.url == "https://example.test/rates" and note.line > 0 for note in notes)
+
+
+def _snapshot_page_with(*fragments):
+    root = Path(__file__).resolve().parents[1] / "snapshots"
+    for folder in sorted(root.iterdir(), reverse=True):
+        manifest = folder / "manifest.json"
+        if not manifest.exists():
+            continue
+        meta = json.loads(manifest.read_text())
+        for item in meta["pages"]:
+            body = (folder / item["file"]).read_text()
+            if all(fragment in body for fragment in fragments):
+                return page(body, url=item["url"], title=item.get("title", "")), meta
+    raise AssertionError(f"No supplied snapshot page contains {fragments}")
+
+
+def test_real_ira_rows_do_not_collapse_jumbo_and_ordinary():
+    source, meta = _snapshot_page_with("Roth: 10 Month Fixed Jumbo Special", "Roth: 10 Month Fixed Special")
+    items = extract_claims(source, meta["snapshot_id"], meta["taken_on"])
+    matched = [c for c in items if "roth: 10 month fixed" in c.evidence.lower()
+               and c.identity.measure == "dividend_rate"]
+    assert len(matched) >= 2
+    assert len({c.identity for c in matched}) == len(matched)
+
+
+def test_real_promotional_columns_have_distinct_periods():
+    source, meta = _snapshot_page_with("Dividend Rate for 1st 6 Months", "Dividend Rate After Promotional Period")
+    items = extract_claims(source, meta["snapshot_id"], meta["taken_on"])
+    promo = [c for c in items if "achieve money market" in c.evidence.lower()
+             and "$250,000-$1,000,000" in c.evidence]
+    periods = {dict(c.identity.qualifiers).get("rate_period") for c in promo}
+    assert "1st 6 months" in periods and "after promotional period" in periods
+    assert len({c.identity for c in promo}) >= 4
