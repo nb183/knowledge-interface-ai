@@ -261,3 +261,14 @@ def test_selected_list_never_uses_a_later_snapshot_for_historical_answer():
     assert "13.00%" in new.text and "11.00%" not in new.text
     assert old.sources[0].snapshot_id == "old"
     assert new.sources[0].snapshot_id == "new"
+
+
+def test_fact_inventory_is_built_without_changing_answer_or_conflict_paths():
+    ks = build()
+    ks.ingest(Snapshot("one", "2026-01-01", [page(
+        "https://example.test/home-loans", "# Home Rates\n\n| Program | Rate |\n"
+        "| --- | --- |\n| Purchase: 30-Year Fixed Conventional $100,000 or less | 7.13% |\n"
+        "Rates are effective as of 01/01/2026.", "Home Loans")]))
+    assert ks.snapshots[0].fact_index.by_family["mortgage"]
+    assert "7.13%" in ks.answer("What is the rate on a 30-year mortgage?").text
+    assert ks.conflicts() == []

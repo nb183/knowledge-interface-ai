@@ -15,7 +15,9 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, str(next(d / "harness" for d in Path(__file__).resolve().parents
                              if (d / "harness" / "contract.py").exists())))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from contract import Answer, Conflict, Source  # noqa: E402
+from facts import FactIndex  # noqa: E402
 
 TOKEN = re.compile(r"[a-z]+(?:'[a-z]+)?|\d+(?:[.,]\d+)*", re.I)
 NUMBER = re.compile(r"(?:\$\s*)?\d[\d,]*(?:\.\d+)?\s*%?")
@@ -205,6 +207,9 @@ class SnapshotIndex:
                 self.postings[token].append((i, count))
                 self.df[token] += 1
         self.avg_length = sum(self.lengths) / max(1, len(self.lengths))
+        # Phase 4A inventory only: answer() and conflicts() still use their
+        # existing passage paths until a separately approved resolution phase.
+        self.fact_index = FactIndex(snap)
 
     def search(self, question, limit=12):
         q = useful(question)
