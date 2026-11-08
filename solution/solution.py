@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 import re
 import sys
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import urlparse
@@ -18,6 +18,8 @@ sys.path.insert(0, str(next(d / "harness" for d in Path(__file__).resolve().pare
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from contract import Answer, Conflict, Source  # noqa: E402
 from facts import FactIndex  # noqa: E402
+from answer_adapter import propose  # noqa: E402
+from resolver import TemporalResolver  # noqa: E402
 
 TOKEN = re.compile(r"[a-z]+(?:'[a-z]+)?|\d+(?:[.,]\d+)*", re.I)
 NUMBER = re.compile(r"(?:\$\s*)?\d[\d,]*(?:\.\d+)?\s*%?")
@@ -595,16 +597,34 @@ class LexicalKnowledge:
     def __init__(self):
         self.snapshots = []
         self.unresolved_evidence = {}
+        self.shadow_diagnostics = deque(maxlen=64)
+        self.shadow_errors = deque(maxlen=64)
+        self._shadow_resolver = None
 
     def ingest(self, snapshot):
         self.snapshots.append(SnapshotIndex(snapshot))
         self.snapshots.sort(key=lambda s: s.taken_on)
+        self._shadow_resolver = None
 
     def _select(self, as_of):
         eligible = [s for s in self.snapshots if as_of is None or s.taken_on <= as_of]
         return eligible[-1] if eligible else None
 
     def answer(self, question, as_of=None):
+        index = self._select(as_of)
+        answer = self._answer_existing(question, as_of)
+        if index is not None:
+            try:
+                if self._shadow_resolver is None:
+                    self._shadow_resolver = TemporalResolver([s.fact_index for s in self.snapshots])
+                record = propose(question, parse_request(question), index,
+                                 self._shadow_resolver, answer, as_of)
+                self.shadow_diagnostics.append(record)
+            except Exception as exc:
+                self.shadow_errors.append((index.snapshot_id, type(exc).__name__, str(exc)[:160]))
+        return answer
+
+    def _answer_existing(self, question, as_of=None):
         index = self._select(as_of)
         if index is None:
             return Answer("I don't know; please contact us for details.", confident=False)
