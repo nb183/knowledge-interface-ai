@@ -683,6 +683,8 @@ class LexicalKnowledge:
         self.shadow_diagnostics = deque(maxlen=64)
         self.shadow_errors = deque(maxlen=64)
         self.promotion_diagnostics = deque(maxlen=64)
+        self.conflict_shadow_diagnostics = deque(maxlen=2)
+        self.conflict_shadow_errors = deque(maxlen=2)
         self._shadow_resolver = None
 
     def ingest(self, snapshot):
@@ -826,6 +828,15 @@ class LexicalKnowledge:
             winner = ", ".join(re.findall(r"\d+(?:\.\d+)?%", latest.text))
             out.append(Conflict(f"{heading}: {row}", values, sources, winner,
                                 "Most recent full website snapshot"))
+        try:
+            try:
+                from .conflict_adapter import analyze
+            except ImportError:
+                from conflict_adapter import analyze
+            resolver = TemporalResolver([s.fact_index for s in self.snapshots])
+            self.conflict_shadow_diagnostics.append(analyze(self.snapshots, resolver))
+        except Exception as exc:
+            self.conflict_shadow_errors.append(f"{type(exc).__name__}: {exc}")
         return out
 
 

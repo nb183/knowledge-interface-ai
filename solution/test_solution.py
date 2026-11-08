@@ -272,3 +272,12 @@ def test_fact_inventory_is_built_without_changing_answer_or_conflict_paths():
     assert ks.snapshots[0].fact_index.by_family["mortgage"]
     assert "7.13%" in ks.answer("What is the rate on a 30-year mortgage?").text
     assert ks.conflicts() == []
+
+
+def test_conflict_shadow_hook_keeps_public_output_and_records_report():
+    ks = build()
+    ks.ingest(Snapshot("one", "2026-01-01", [page(
+        "https://example.test/rates", "# Rates\n| Product | APY |\n| --- | --- |\n| Savings | 1.00% |")]))
+    assert ks.conflicts() == []
+    assert len(ks.conflict_shadow_diagnostics) == 1
+    assert not ks.conflict_shadow_errors
