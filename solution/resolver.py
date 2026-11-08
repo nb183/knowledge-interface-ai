@@ -23,9 +23,25 @@ class ConflictCandidate:
     topic: str
     values: tuple[str, ...]
     claims: tuple[Claim, ...]
-    classification: str  # confirmed_overlap or unknown
+    classification: str  # confirmed_overlap, unknown, or stale_or_superseded
     resolution: str | None
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewGroup:
+    """One source-row comparison with every original candidate retained."""
+    classification: str
+    comparisons: tuple[ConflictCandidate, ...]
+
+    @property
+    def claims(self) -> tuple[Claim, ...]:
+        # Intentionally keep repeated claims: this is grouping, not evidence deduplication.
+        return tuple(claim for comparison in self.comparisons for claim in comparison.claims)
+
+    @property
+    def snapshot_ids(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(claim.snapshot_id for claim in self.claims))
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +67,41 @@ def qualifier_match(request: FactIdentity, candidate: FactIdentity) -> str:
         elif a != b:
             return "incompatible"
     return "compatible_unknown" if unknown else "exact"
+
+
+def classify_pair(left: Claim, right: Claim) -> str:
+    """Classify evidence without asserting that an unknown qualifier is a match."""
+    match = qualifier_match(left.identity, right.identity)
+    if match == "incompatible" or _value_key(left) == _value_key(right):
+        return "non_conflict"
+    if match != "exact" or not all(_complete_conflict_identity(c.identity) for c in (left, right)):
+        return "unresolved"
+    state = relationship(left, right)
+    if state == "confirmed_overlap":
+        return "confirmed_simultaneous"
+    # An explicit non-overlapping validity interval is required for this
+    # retained stale-source category; differing effective dates alone do not do it.
+    if temporal_relationship(left, right) == "confirmed_succession" and all(
+            c.dates.reporting_year is None for c in (left, right)):
+        return "stale_or_superseded"
+    return "unresolved"
+
+
+def _row_key(claim: Claim):
+    return (claim.url, claim.section, claim.evidence, claim.dates.effective_on,
+            claim.dates.expires_on, claim.dates.published_on,
+            claim.identity.family, claim.identity.subject)
+
+
+def group_review_records(candidates) -> tuple[ReviewGroup, ...]:
+    """Collapse repeated measures/snapshots while preserving every source claim."""
+    grouped = {}
+    for candidate in candidates:
+        disposition = {"confirmed_overlap": "confirmed_simultaneous",
+                       "unknown": "unresolved"}.get(candidate.classification, candidate.classification)
+        key = (disposition, tuple(sorted((_row_key(c) for c in candidate.claims), key=repr)))
+        grouped.setdefault(key, []).append(candidate)
+    return tuple(ReviewGroup(key[0], tuple(members)) for key, members in grouped.items())
 
 
 def _complete_conflict_identity(identity: FactIdentity) -> bool:
@@ -250,3 +301,36 @@ class TemporalResolver:
                         (left, right), "unknown", None,
                         "missing_qualifier" if match == "compatible_unknown" else "incomplete_fact_identity"))
         return tuple(result)
+
+    def discover_stale_candidates(self, selected_snapshot: str | FactIndex):
+        """Retain explicitly expired older rows alongside later rows for review."""
+        sid = selected_snapshot if isinstance(selected_snapshot, str) else selected_snapshot.snapshot_id
+        index = self.indexes[sid]
+        result = []
+        for identity, claims in index.by_identity.items():
+            if not _complete_conflict_identity(identity):
+                continue
+            unique = _deduplicate(claims)
+            for pos, older in enumerate(unique):
+                for newer in unique[pos + 1:]:
+                    if classify_pair(older, newer) != "stale_or_superseded":
+                        continue
+                    result.append(ConflictCandidate(
+                        f"{identity.family}: {identity.subject} {identity.measure}",
+                        (older.value.raw, newer.value.raw), (older, newer),
+                        "stale_or_superseded", None, "explicit_nonoverlapping_validity"))
+        return tuple(result)
+
+    def group_review_candidates(self, selected_snapshots: tuple[str, ...] | None = None):
+        """Group internal comparisons across snapshots without losing evidence."""
+        ids = selected_snapshots or tuple(self.indexes)
+        records = []
+        for sid in ids:
+            index = self.indexes[sid]
+            if not index.claims:
+                continue
+            target = index.claims[0].dates.snapshot_on
+            records.extend(self.discover_review_candidates(sid, target))
+            records.extend(self.discover_conflicts(sid, target))
+            records.extend(self.discover_stale_candidates(sid))
+        return group_review_records(records)

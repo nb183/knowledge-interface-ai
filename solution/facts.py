@@ -144,6 +144,7 @@ class Claim:
     section: str
     evidence: str
     line: int
+    qualifier_provenance: tuple[tuple[str, str, str], ...] = ()
 
 
 def temporal_relationship(left: Claim, right: Claim) -> str:
@@ -206,11 +207,23 @@ def _table_dates(lines: list[str], end: int) -> tuple[str | None, str | None]:
 
 
 def _claim(identity: FactIdentity, value: TypedValue, dates: ClaimDates,
-           snapshot_id: str, page, section: str, evidence: str, line: int, field: str) -> Claim:
+           snapshot_id: str, page, section: str, evidence: str, line: int, field: str,
+           qualifier_provenance: tuple[tuple[str, str, str], ...] = ()) -> Claim:
     raw_id = "\x1f".join((snapshot_id, page.url, str(line), field,
                           repr(identity), value.raw, evidence))
     return Claim(hashlib.sha256(raw_id.encode()).hexdigest()[:24], identity, value,
-                 dates, snapshot_id, page.url, page.title, section, evidence, line)
+                 dates, snapshot_id, page.url, page.title, section, evidence, line,
+                 qualifier_provenance)
+
+
+def _explicit_scope(page, section: str, subject: str) -> tuple[str, str, str] | None:
+    """Return a scope only when the row, section, or page title says it."""
+    for origin, evidence in (("row", subject), ("section", section), ("title", page.title)):
+        business = bool(re.search(r"\bbusiness\b", evidence, re.I))
+        personal = bool(re.search(r"\bpersonal\b", evidence, re.I))
+        if business != personal:
+            return ("business" if business else "personal", origin, evidence)
+    return None
 
 
 def extract_claims(page, snapshot_id: str, snapshot_on: str,
@@ -305,6 +318,10 @@ def extract_claims(page, snapshot_id: str, snapshot_on: str,
                     term = re.search(r"\b\d{1,3}[- ](?:months?|years?)\b|\b\d{1,2}/\d{1,2}\b", normalize(subject))
                     term_value = re.sub(r"\b(months|years)\b", lambda m: m.group()[:-1], term.group().replace("-", " ")) if term else ""
                     minimum = normalized_amount(row.get("min. to earn", "") or row.get("minimum to earn", ""))
+                    explicit_scope = _explicit_scope(page, section, subject)
+                    url_scope = ("business" if "/business" in page.url else
+                                 "personal" if "/personal" in page.url else "")
+                    scope = explicit_scope[0] if explicit_scope else url_scope
                     qualifiers = {"tier": normalized_tier(row.get("balance tier", "") or row.get("balance", "") or
                                                              (re.search(r"\$[\d,]+\s+or\s+less", subject, re.I) or [""])[0]),
                                   "term": term_value,
@@ -320,8 +337,7 @@ def extract_claims(page, snapshot_id: str, snapshot_on: str,
                                   "rate_structure": ("arm" if re.search(r"\barm\b|adjustable", lower) else
                                                      "fixed" if "fixed" in normalize(subject) else "")
                                                     if family == "mortgage" else "",
-                                  "scope": "business" if "/business" in page.url else
-                                           ("personal" if "/personal" in page.url else "")}
+                                  "scope": scope}
                     # The product name carries card/deposit identity; qualifiers
                     # keep tiers and loan terms distinct within that product.
                     for col, (header, cell) in enumerate(zip(headers, cells)):
@@ -354,9 +370,14 @@ def extract_claims(page, snapshot_id: str, snapshot_on: str,
                                                effective, expires)
                             identity = FactIdentity.make(family, product, measure, **qualifiers,
                                                          rate_period=condition)
+                            provenance = ()
+                            if explicit_scope and explicit_scope[0] == scope:
+                                provenance += (("scope", explicit_scope[1], explicit_scope[2]),)
+                            if condition:
+                                provenance += (("rate_period", "header", table[0][2][col]),)
                             claims.append(_claim(identity, value, dates, snapshot_id, page,
                                                  section + (" > " + section_label if section_label else ""),
-                                                 evidence, number, f"{col}:{header}"))
+                                                 evidence, number, f"{col}:{header}", provenance))
             continue
         if line and not line.startswith(("#", "[", "!", "* *")) and len(line) < 75 and not re.search(r"[.!?]$", line):
             # Plain labels often delimit product tables on the supplied rate pages.

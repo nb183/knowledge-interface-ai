@@ -1,10 +1,12 @@
 """Synthetic resolver tests independent of the submission answer path."""
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 from solution.facts import FactIdentity, FactIndex
-from solution.resolver import FactPattern, TemporalResolver, qualifier_match, relationship
+from solution.resolver import (ConflictCandidate, FactPattern, TemporalResolver,
+                               classify_pair, group_review_records, qualifier_match, relationship)
 
 
 def snapshot(sid, taken, *pages):
@@ -193,3 +195,82 @@ def test_real_snapshot_ira_and_promotion_false_positives_are_not_confirmed():
     assert not any(c.classification == "confirmed_overlap" and
                    c.claims[0].identity.subject in {"ira certificate", "achieve money market"}
                    for c in candidates)
+
+
+def test_labeled_conflict_quality_fixture_keeps_four_outcomes_distinct():
+    """Manually labeled synthetic gold: contradiction, non-conflict, stale, unresolved."""
+    confirmed = snapshot("one", "2026-09-28",
+                         ("https://example.test/a", "Home Rates", mortgage("6.00%", "09/25/2026")),
+                         ("https://example.test/b", "Home Rates", mortgage("7.00%", "09/25/2026")))
+    tiered = snapshot("two", "2026-09-28",
+                      ("https://example.test/a", "Home Rates", mortgage("6.00%", "09/25/2026")),
+                      ("https://example.test/b", "Home Rates",
+                       mortgage("7.00%", "09/25/2026", tier="$200,000 or less")))
+    stale = snapshot("three", "2026-09-28",
+                     ("https://example.test/a", "Home Rates",
+                      mortgage("6.00%", "04/01/2026", "06/30/2026")),
+                     ("https://example.test/b", "Home Rates", mortgage("7.00%", "09/25/2026")))
+    undated = snapshot("four", "2026-09-28",
+                       ("https://example.test/a", "Home Rates", mortgage("6.00%")),
+                       ("https://example.test/b", "Home Rates", mortgage("7.00%", "09/25/2026")))
+    periods = snapshot("five", "2026-09-28",
+                       ("https://example.test/a", "Savings Rates",
+                        "# Savings Rates\n| Account Type | Dividend Rate for 1st 6 Months |\n"
+                        "| --- | --- |\n| Achieve Money Market | 4.00% |\n"),
+                       ("https://example.test/b", "Savings Rates",
+                        "# Savings Rates\n| Account Type | Dividend Rate |\n"
+                        "| --- | --- |\n| Achieve Money Market | 3.20% |\n"))
+    products = snapshot("six", "2026-09-28",
+                        ("https://example.test/a", "Savings Rates",
+                         "# Savings Rates\n| Account Type | APY |\n| --- | --- |\n"
+                         "| Share Savings | 0.20% |\n| Bright Savings | 2.20% |\n"))
+    measures = snapshot("seven", "2026-09-28",
+                        ("https://example.test/a", "Savings Rates",
+                         "# Savings Rates\n| Account Type | Dividend Rate | APY |\n"
+                         "| --- | --- | --- |\n| Share Savings | 0.15% | 0.20% |\n"))
+    missing = replace(confirmed.claims[1], identity=FactIdentity.make(
+        "mortgage", "mortgage", "interest_rate", term="30 year", transaction="purchase"))
+    fixture = (
+        (confirmed.claims, "confirmed_simultaneous"),
+        (tiered.claims, "non_conflict"),
+        (products.claims, "non_conflict"),
+        (measures.claims, "non_conflict"),
+        (stale.claims, "stale_or_superseded"),
+        (undated.claims, "unresolved"),
+        (periods.claims, "unresolved"),
+        ((confirmed.claims[0], missing), "unresolved"),
+    )
+    observed = [classify_pair(*pair) for pair, _ in fixture]
+    gold = [label for _, label in fixture]
+    assert observed == gold
+    positives = sum(x == "confirmed_simultaneous" for x in observed)
+    assert positives == sum(x == "confirmed_simultaneous" for x in gold) == 1
+    assert TemporalResolver([confirmed]).resolve(pattern(confirmed.claims[0]),
+                                                  "2026-09-28", "one").winner is None
+    assert TemporalResolver([stale]).discover_stale_candidates("three")[0].classification == "stale_or_superseded"
+
+
+def test_review_grouping_keeps_every_comparison_claim_and_snapshot():
+    def paired(sid):
+        index = snapshot(sid, "2026-09-28",
+                         ("https://example.test/a", "Home Rates",
+                          "# Home Rates\n| Program | Rate | APR |\n| --- | --- | --- |\n"
+                          "| Purchase: 30-Year Fixed Conventional $100,000 or less | 6.00% | 6.10% |\n"),
+                         ("https://example.test/b", "Home Rates",
+                          "# Home Rates\n| Program | Rate | APR |\n| --- | --- | --- |\n"
+                          "| Purchase: 30-Year Fixed Conventional $100,000 or less | 7.00% | 7.10% |\n"))
+        return index
+    records = []
+    for index in (paired("old"), paired("new")):
+        by_measure = {}
+        for claim in index.claims:
+            by_measure.setdefault(claim.identity.measure, []).append(claim)
+        for measure, claims in by_measure.items():
+            records.append(ConflictCandidate(measure, tuple(c.value.raw for c in claims),
+                                             tuple(claims), "unknown", None, "review"))
+    grouped = group_review_records(records)
+    assert len(records) == 4 and len(grouped) == 1
+    assert grouped[0].comparisons == tuple(records)
+    assert len(grouped[0].claims) == 8  # No claim is silently discarded.
+    assert set(grouped[0].snapshot_ids) == {"old", "new"}
+    assert {c.url for c in grouped[0].claims} == {"https://example.test/a", "https://example.test/b"}

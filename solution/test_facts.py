@@ -253,3 +253,47 @@ def test_real_promotional_columns_have_distinct_periods():
     periods = {dict(c.identity.qualifiers).get("rate_period") for c in promo}
     assert "1st 6 months" in periods and "after promotional period" in periods
     assert len({c.identity for c in promo}) >= 4
+
+
+def test_scope_provenance_requires_explicit_title_section_or_row_evidence():
+    table = ("| Account Type | Balance Tier | APY |\n| --- | --- | --- |\n"
+             "| Share Savings | $25,000+ | 0.20% |\n")
+    explicit = claims("# Business Rates\n" + table,
+                      url="https://example.test/rates", title="Deposit Rates")[0]
+    generic = claims("# Rates\n" + table,
+                     url="https://example.test/rates", title="Deposit Rates")[0]
+    url_only = claims("# Rates\n" + table,
+                      url="https://example.test/personal/rates", title="Deposit Rates")[0]
+    assert dict(explicit.identity.qualifiers)["scope"] == "business"
+    assert explicit.qualifier_provenance == (("scope", "section", "business rates"),)
+    assert "scope" not in dict(generic.identity.qualifiers)
+    assert generic.qualifier_provenance == ()
+    assert dict(url_only.identity.qualifiers)["scope"] == "personal"
+    assert url_only.qualifier_provenance == ()  # URL context is not explicit table evidence.
+
+
+def test_rate_period_provenance_preserves_exact_header_text():
+    body = ("# Money Market Rates\n| Account Type | Dividend Rate for 1st 6 Months |\n"
+            "| --- | --- |\n| Achieve Money Market | 4.00% |\n")
+    claim = claims(body)[0]
+    assert ("rate_period", "header", "Dividend Rate for 1st 6 Months") in claim.qualifier_provenance
+    assert claim.evidence == "| Achieve Money Market | 4.00% |"
+
+
+def test_real_business_scope_is_explicit_and_generic_scope_stays_unknown():
+    source, meta = _snapshot_page_with("Business Term-Share Certificate Rates",
+                                       "17 Month Fixed Jumbo Certificate Special")
+    business_claims = extract_claims(source, meta["snapshot_id"], meta["taken_on"])
+    business = next(c for c in business_claims if "17 Month Fixed Jumbo Certificate Special" in c.evidence)
+    assert dict(business.identity.qualifiers).get("scope") == "business"
+    assert any(field == "scope" and "business" in evidence.lower()
+               for field, _, evidence in business.qualifier_provenance)
+    root = Path(__file__).resolve().parents[1] / "snapshots"
+    folder = next(d for d in sorted(root.iterdir(), reverse=True) if (d / "manifest.json").exists())
+    current = json.loads((folder / "manifest.json").read_text())
+    item = next(p for p in current["pages"] if p.get("title", "").startswith("Deposit and Loan Rates:"))
+    generic_page = page((folder / item["file"]).read_text(), url=item["url"], title=item["title"])
+    generic_claims = extract_claims(generic_page, current["snapshot_id"], current["taken_on"])
+    generic = next(c for c in generic_claims if "17 Month Fixed Jumbo Certificate Special" in c.evidence)
+    assert "scope" not in dict(generic.identity.qualifiers)
+    assert not any(field == "scope" for field, _, _ in generic.qualifier_provenance)
