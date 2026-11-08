@@ -31,6 +31,10 @@ class ShadowRecord:
     rules: tuple[str, ...]
     resolver_ms: float
     adapter_ms: float
+    classification: str | None = None
+    classification_reason: str | None = None
+    proposed_citations: tuple[tuple[str, str], ...] = ()
+    source_notes: tuple[str, ...] = ()
 
     @property
     def changes_answer(self):
@@ -39,6 +43,11 @@ class ShadowRecord:
 
 def _qualifiers(claim: Claim):
     return dict(claim.identity.qualifiers)
+
+
+def _display_tier(claim: Claim):
+    cells = claim.evidence.split("|")
+    return cells[2].strip() if len(cells) > 2 and "$" in cells[2] else _qualifiers(claim).get("tier", "")
 
 
 class _TimedResolver:
@@ -71,6 +80,40 @@ def _tier_cap(claim: Claim):
     return Decimal(match.group(1)) if match else None
 
 
+def _tier_list(claims):
+    previous = None
+    parts = []
+    for claim in sorted(claims, key=_tier_cap):
+        cap = _tier_cap(claim)
+        label = (f"up to ${cap:,.0f}" if previous is None else
+                 f"over ${previous:,.0f} and up to ${cap:,.0f}")
+        parts.append(f"{label}: {claim.value.raw}")
+        previous = cap
+    return "; ".join(parts)
+
+
+def _table_notes(index, claim):
+    page = index.pages.get(claim.url)
+    if page is None:
+        return ()
+    lines = page.markdown.splitlines()
+    i = claim.line
+    while i < len(lines) and lines[i].strip().startswith("|"):
+        i += 1
+    notes = []
+    for line in lines[i:i + 12]:
+        value = line.strip()
+        if value.startswith(("#", "|")):
+            break
+        if value.startswith("["):
+            break
+        if value:
+            notes.append(value)
+        if sum(map(len, notes)) > 2000:
+            return ()
+    return tuple(notes)
+
+
 def _balance_in_tier(tier: str, amount: Decimal):
     plus = re.fullmatch(r"\$(\d+(?:\.\d+)?)\+", tier)
     if plus:
@@ -98,6 +141,11 @@ def _mortgage(question, spec, index, resolver, target):
     if (q.get("program") != "standard" or
             re.search(r"\b(?:adjustable|variable|arm|jumbo)\b", question, re.I)):
         return None, (), (), "incompatible_mortgage_product"
+    if (re.search(r"\bapr\b", question, re.I) and
+            (re.search(r"\binterest\s+rates?\b", question, re.I) or
+             re.search(r"\brates?\s*(?:and|&|/)\s*aprs?\b", question, re.I) or
+             re.search(r"\baprs?\s*(?:and|&|/)\s*rates?\b", question, re.I))):
+        return None, (), (), "multiple_requested_measures"
     term = term.replace("-", " ")
     measure = "apr" if re.search(r"\bapr\b", question, re.I) else "interest_rate"
     transaction = q.get("transaction")
@@ -122,7 +170,7 @@ def _mortgage(question, spec, index, resolver, target):
             return None, (), (), "different_transaction_schedules"
         claims = tuple(c for _, group, _ in proposals for c in group)
         rules = tuple(dict.fromkeys(rule for _, _, group_rules in proposals for rule in group_rules))
-        tiers = "; ".join(f"up to ${cap:,.0f}: {value}" for cap, value, _ in signatures[0])
+        tiers = _tier_list(proposals[0][1])
         names = " and ".join(name for name, _, _ in proposals)
         return (f"Published {names} {term.replace(' ', '-')} fixed conventional mortgage "
                 f"{measure.replace('_', ' ')}s effective {signatures[0][0][2]}: {tiers}."), claims, rules, "accepted"
@@ -142,8 +190,18 @@ def _mortgage(question, spec, index, resolver, target):
         winner, reason, rules = _resolve_one(resolver, index, candidates[0], target)
         if winner is None or not _rate_supported(winner, term, transaction, measure):
             return None, (), rules, reason
+        earlier = [_tier_cap(c) for c in index.fact_index.by_family.get("mortgage", ())
+                   if c.url == winner.url and c.section == winner.section
+                   and c.dates.effective_on == winner.dates.effective_on
+                   and c.identity.measure == winner.identity.measure
+                   and _qualifiers(c).get("term") == term
+                   and _qualifiers(c).get("transaction") == transaction
+                   and _tier_cap(c) is not None and _tier_cap(c) < cap]
+        tier_label = (f"over ${max(earlier):,.0f} and up to ${cap:,.0f}" if earlier else
+                      f"up to ${cap:,.0f}")
         return (f"{transaction.title()} {term.replace(' ', '-')} fixed conventional "
-                f"mortgage, loans up to ${cap:,.0f}: {winner.value.raw} {measure.replace('_', ' ')}."), (winner,), rules, "accepted"
+                f"mortgage, loans {tier_label}: {winner.value.raw} {measure.replace('_', ' ')}, "
+                f"effective {winner.dates.effective_on}."), (winner,), rules, "accepted"
 
     # Broad questions require every tier in one source schedule and a resolved
     # claim for every row. A lone top hit never establishes completeness.
@@ -170,8 +228,7 @@ def _mortgage(question, spec, index, resolver, target):
             return None, (), tuple(all_rules), "mixed_schedule_sources"
         winners.append(winner)
     text = (f"{transaction.title()} {term.replace(' ', '-')} fixed conventional mortgage "
-            f"rates effective {key[2]}: " + "; ".join(
-                f"up to ${_tier_cap(c):,.0f}: {c.value.raw}" for c in winners) + ".")
+            f"{measure.replace('_', ' ')}s effective {key[2]}: " + _tier_list(winners) + ".")
     return text, tuple(winners), tuple(dict.fromkeys(all_rules)), "accepted"
 
 
@@ -236,7 +293,7 @@ def _savings(question, spec, index, resolver, target):
     if winner is None or winner.identity.subject not in normalize(winner.evidence):
         return None, (), rules, reason
     return (f"{winner.identity.subject.title()} at the {winner.value.raw} {measure.replace('_', ' ')} "
-            f"for balance tier {_qualifiers(winner).get('tier')}."), (winner,), rules, "accepted"
+            f"for balance tier {_display_tier(winner)}, effective {winner.dates.effective_on}."), (winner,), rules, "accepted"
 
 
 def _untiered_savings(question, index, resolver, target):
@@ -285,10 +342,12 @@ def _untiered_savings(question, index, resolver, target):
         if not tier.endswith("+"):
             return None, (), tuple(rules), "highest_tier_not_open_ended"
         return (f"The highest published {subject.title()} {measure.upper()} is {best.value.raw} "
-                f"for balances of {tier}."), (best,), tuple(dict.fromkeys(rules)), "accepted"
+                f"for balances of {_display_tier(best)}, effective {best.dates.effective_on}.",
+                (best,), tuple(dict.fromkeys(rules)), "accepted")
     tier = next(iter(tiers))
     facts = ", ".join(f"{c.value.raw} {c.identity.measure.replace('_', ' ')}" for c in winners)
-    return (f"Published {subject.title()} rates for balance tier {tier}: {facts}.",
+    return (f"Published {subject.title()} rates for balance tier {_display_tier(winners[0])}, "
+            f"effective {key[2]}: {facts}.",
             tuple(winners), tuple(dict.fromkeys(rules)), "accepted")
 
 
@@ -311,8 +370,13 @@ def propose(question, spec, index, resolver: TemporalResolver, existing_answer, 
     else:
         result = (None, (), (), "unsupported_request")
     text, claims, rules, reason = result
+    notes = _table_notes(index, claims[0]) if claims else ()
+    if text and notes:
+        text += " Conditions: " + " ".join(notes)
     return ShadowRecord(question[:240], index.snapshot_id, target, requested,
                         reason == "accepted", reason, text, existing_answer.text[:1000],
                         claims[:12], tuple(rules)[:12],
                         round(timed.elapsed * 1000, 3),
-                        round((time.perf_counter() - started) * 1000, 3))
+                        round((time.perf_counter() - started) * 1000, 3),
+                        proposed_citations=tuple((c.url, c.evidence) for c in claims[:12]),
+                        source_notes=notes)

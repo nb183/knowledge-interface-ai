@@ -9,6 +9,7 @@ import math
 import re
 import sys
 from collections import Counter, defaultdict, deque
+from dataclasses import replace
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import urlparse
@@ -20,6 +21,7 @@ from contract import Answer, Conflict, Source  # noqa: E402
 from facts import FactIndex  # noqa: E402
 from answer_adapter import propose  # noqa: E402
 from resolver import TemporalResolver  # noqa: E402
+from promotion import classify  # noqa: E402
 
 TOKEN = re.compile(r"[a-z]+(?:'[a-z]+)?|\d+(?:[.,]\d+)*", re.I)
 NUMBER = re.compile(r"(?:\$\s*)?\d[\d,]*(?:\.\d+)?\s*%?")
@@ -619,6 +621,9 @@ class LexicalKnowledge:
                     self._shadow_resolver = TemporalResolver([s.fact_index for s in self.snapshots])
                 record = propose(question, parse_request(question), index,
                                  self._shadow_resolver, answer, as_of)
+                if record.eligible:
+                    status, reason = classify(record, answer, index)
+                    record = replace(record, classification=status, classification_reason=reason)
                 self.shadow_diagnostics.append(record)
             except Exception as exc:
                 self.shadow_errors.append((index.snapshot_id, type(exc).__name__, str(exc)[:160]))
