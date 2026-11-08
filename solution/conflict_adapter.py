@@ -16,14 +16,15 @@ except ImportError:  # The harness loads solution.py with its own path.
     from contract import Conflict, Source
 
 try:
-    from .facts import Claim, FactIdentity, temporal_relationship
+    from .facts import Claim, FactIdentity, MODEL_YEAR_RE, OLDER_MODEL_RE, normalize, temporal_relationship
     from .resolver import TemporalResolver, qualifier_match
 except ImportError:
-    from facts import Claim, FactIdentity, temporal_relationship
+    from facts import Claim, FactIdentity, MODEL_YEAR_RE, OLDER_MODEL_RE, normalize, temporal_relationship
     from resolver import TemporalResolver, qualifier_match
 
 
 SUPPORTED = frozenset(("mortgage", "deposit", "certificate"))
+REVIEW_ONLY = frozenset(("auto", "fee", "branch"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +253,53 @@ def _deduplicate_proposals(cases: list[ShadowCase]) -> tuple[Conflict, ...]:
     return tuple(chosen.values())
 
 
+def _source_line_verified(claim: Claim, index) -> bool:
+    if claim.snapshot_id != index.snapshot_id:
+        return False
+    page = index.pages.get(claim.url)
+    if page is None:
+        return False
+    lines = page.markdown.splitlines()
+    if not 1 <= claim.line <= len(lines) or lines[claim.line - 1].strip() != claim.evidence.strip():
+        return False
+    if claim.identity.family == "auto":
+        row = _row_fields(claim, page)
+        if row is None or len(row) != 3 or claim.identity.measure != "apr":
+            return False
+        headers, cells = list(row), list(row.values())
+        q = dict(claim.identity.qualifiers)
+        years = MODEL_YEAR_RE.fullmatch(normalize(cells[0]).replace("–", "-"))
+        older = OLDER_MODEL_RE.fullmatch(normalize(cells[0]))
+        if not (years or older) or not re.fullmatch(r"\d{1,3}\s+months?", normalize(cells[1])):
+            return False
+        start = int(years.group(1)) if years else None
+        end = (int(years.group(2)) if len(years.group(2)) == 4 else
+               int(years.group(1)[:2] + years.group(2))) if years else int(older.group(1))
+        if (q.get("model_year_start") != (str(start) if start else None)
+                or q.get("model_year_end") != str(end)
+                or q.get("term") != normalize(cells[1]).removesuffix("s")):
+            return False
+        header_apr = "annual percentage rate" in headers[2] or re.search(r"\bapr\b", headers[2])
+        cell_apr = re.search(r"\bapr\b", cells[2], re.I)
+        return bool((header_apr or cell_apr) and ("annual percentage yield" not in headers[2] or cell_apr)
+                    and claim.value.raw in cells[2])
+    return claim.value.raw in claim.evidence or claim.identity.family == "branch"
+
+
+def _auto_range(claim: Claim) -> tuple[int, int] | None:
+    q = dict(claim.identity.qualifiers)
+    if not q.get("model_year_end"):
+        return None
+    start = int(q.get("model_year_start") or 0)
+    end = int(q["model_year_end"])
+    return (start, end) if start <= end else None
+
+
+def _review_new_pair(left: Claim, right: Claim, index, reason: str) -> ShadowCase:
+    rule = reason if _source_line_verified(left, index) and _source_line_verified(right, index) else "unverified_new_source_row"
+    return ShadowCase("unresolved", index.snapshot_id, (left, right), rule)
+
+
 def analyze(indexes, resolver: TemporalResolver) -> ShadowConflictReport:
     """Compare one snapshot at a time; keep all records and dedupe only proposals."""
     cases = []
@@ -259,14 +307,32 @@ def analyze(indexes, resolver: TemporalResolver) -> ShadowConflictReport:
     for index in indexes:
         by_identity = defaultdict(list)
         for claim in index.fact_index.claims:
-            if claim.identity.family in SUPPORTED:
+            if claim.identity.family in SUPPORTED | REVIEW_ONLY:
                 by_identity[claim.identity].append(claim)
         for claims in by_identity.values():
             for pos, left in enumerate(claims):
                 for right in claims[pos + 1:]:
                     if left.value.kind != right.value.kind or left.value.value == right.value.value:
                         continue
-                    cases.append(classify_snapshot_pair(left, right, index))
+                    if left.identity.family in REVIEW_ONLY:
+                        cases.append(_review_new_pair(left, right, index, "new_category_review_only"))
+                    else:
+                        cases.append(classify_snapshot_pair(left, right, index))
+        auto = [claim for claim in index.fact_index.claims if claim.identity.family == "auto"]
+        for pos, left in enumerate(auto):
+            for right in auto[pos + 1:]:
+                if (left.identity == right.identity or left.value.value == right.value.value
+                        or left.url == right.url):
+                    continue
+                a, b = dict(left.identity.qualifiers), dict(right.identity.qualifiers)
+                if (left.identity.measure != right.identity.measure
+                        or any(a.get(key) != b.get(key) for key in ("program", "term"))):
+                    continue
+                first, second = _auto_range(left), _auto_range(right)
+                if first and second and max(first[0], second[0]) <= min(first[1], second[1]):
+                    rule = ("overlapping_auto_model_year_ranges" if a.get("rate_type") == b.get("rate_type")
+                            else "overlapping_auto_ranges_different_rate_type")
+                    cases.append(_review_new_pair(left, right, index, rule))
         for candidate in resolver.discover_review_candidates(index.snapshot_id, index.taken_on):
             cases.append(ShadowCase("unresolved", index.snapshot_id, candidate.claims,
                                     candidate.reason))

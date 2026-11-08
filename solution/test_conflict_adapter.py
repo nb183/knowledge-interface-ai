@@ -3,6 +3,7 @@ from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
+from harness.contract import Page, Snapshot
 from harness.run_eval import load_snapshots
 from solution.conflict_adapter import (ShadowCase, _deduplicate_proposals, _key,
                                        _proposal, analyze, classify_snapshot_pair)
@@ -163,3 +164,68 @@ def test_real_proposals_keep_each_claims_dates_values_and_quotes():
         assert case.proposed.values == [claim.value.raw for claim in case.claims]
         assert [(source.url, source.snapshot_id, source.quote) for source in case.proposed.sources] == [
             (claim.url, claim.snapshot_id, claim.evidence) for claim in case.claims]
+
+
+def test_overlapping_auto_ranges_are_review_only_and_no_cross_measure_match():
+    site = build()
+    product = ("# Auto Loans\nAuto Loan Rates\n"
+               "| Loan Program | Term | Annual Percentage Rate (As Low As) |\n"
+               "| --- | --- | --- |\n| 2024-27 Model Year | 60 Months | 5.39% APR |\n"
+               "Rates are effective as of 08/31/2026.\n")
+    calculator = ("# Auto Loan Calculator\nAuto Loan Rates\n"
+                  "| Account Type | Balance Tier | Annual Percentage Yield |\n"
+                  "| --- | --- | --- |\n| 2023–26 Model Year | 60 Months | 5.34% APR |\n"
+                  "Rates are effective as of 01/01/2026.\n")
+    site.ingest(Snapshot("one", "2026-09-28", [
+        Page("https://example.test/product", "Auto Loans", product, "2026-09-28T00:00:00Z"),
+        Page("https://example.test/calculator", "Auto Loan Calculator", calculator,
+             "2026-09-28T00:00:00Z")]))
+    index = site.snapshots[0]
+    report = analyze([index], TemporalResolver([index.fact_index]))
+    overlap = [case for case in report.cases if "overlapping_auto" in case.rule]
+    assert len(overlap) == 1
+    assert overlap[0].classification == "unresolved" and overlap[0].proposed is None
+    assert {c.identity.measure for c in overlap[0].claims} == {"apr"}
+    assert {dict(c.identity.qualifiers)["model_year_start"] for c in overlap[0].claims} == {"2023", "2024"}
+    assert all(c.evidence in index.pages[c.url].markdown for c in overlap[0].claims)
+    assert report.proposed == ()
+
+
+def test_real_new_categories_remain_internal_and_snapshot_isolated():
+    site = _site()
+    for index in (site.snapshots[0], site.snapshots[-1]):
+        report = analyze([index], TemporalResolver([index.fact_index]))
+        new = [case for case in report.cases if "auto" in case.rule or case.rule == "new_category_review_only"]
+        assert new
+        assert all(case.snapshot_id == index.snapshot_id and case.proposed is None for case in new)
+        assert all(claim.snapshot_id == index.snapshot_id for case in new for claim in case.claims)
+    latest = site.snapshots[-1]
+    assert latest.fact_index.by_family["fee"] and latest.fact_index.by_family["branch"]
+    assert all(c.url in latest.pages for c in latest.fact_index.by_family["fee"])
+    copied = {}
+    for claim in latest.fact_index.by_family["fee"]:
+        copied.setdefault((claim.identity, claim.value.value), set()).add(claim.url)
+    assert any(len(urls) > 1 for urls in copied.values())
+
+
+def test_fee_and_branch_differences_stay_review_only_with_all_sources():
+    site = build()
+    fee = ("## Rate and Fee Schedule\nEffective February 17, 2025\n"
+           "| Deposit Services Consumer | Col2 |\n| --- | --- |\n"
+           "| Stop payment (check) | ${amount} per item |\n")
+    branch = "# Cedar Branch\n**Lobby** Monday: {hours}\n"
+    pages = [Page("https://example.test/fees/a", "Fee Schedule", fee.format(amount="30.00"), "2026-09-28T00:00:00Z"),
+             Page("https://example.test/fees/b", "Fee Schedule", fee.format(amount="35.00"), "2026-09-28T00:00:00Z"),
+             Page("https://example.test/branch/a", "Branch", branch.format(hours="8 a.m.–5 p.m."), "2026-09-28T00:00:00Z"),
+             Page("https://example.test/branch/b", "Branch", branch.format(hours="9 a.m.–5 p.m."), "2026-09-28T00:00:00Z")]
+    site.ingest(Snapshot("one", "2026-09-28", pages))
+    index = site.snapshots[0]
+    report = analyze([index], TemporalResolver([index.fact_index]))
+    for family in ("fee", "branch"):
+        cases = [case for case in report.cases if case.claims[0].identity.family == family
+                 and case.rule == "new_category_review_only"]
+        assert len(cases) == 1
+        assert cases[0].proposed is None
+        assert len({claim.url for claim in cases[0].claims}) == 2
+        assert all(claim.evidence in index.pages[claim.url].markdown for claim in cases[0].claims)
+    assert report.proposed == ()

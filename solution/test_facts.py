@@ -222,6 +222,115 @@ def test_irregular_empty_and_ambiguous_rate_cells_keep_diagnostics():
     assert all(note.url == "https://example.test/rates" and note.line > 0 for note in notes)
 
 
+def test_auto_apr_keeps_exact_model_interval_term_and_table_role():
+    body = ("# Auto Loans\nAuto Loan Rates\n"
+            "| Loan Program | Term | Annual Percentage Rate (As Low As) |\n"
+            "| --- | --- | --- |\n"
+            "| 2024-27 Model Year | 60 Months | 5.39% APR |\n"
+            "| 2021-23 Model Year | 60 Months | 5.64% APR |\n"
+            "Rates are effective as of 08/31/2026.\n"
+            "Auto loan payment example for illustrative purposes only: $30,000 at 5.39% APR.\n")
+    items = claims(body, title="Auto & Motorcycle Loans")
+    assert len(items) == 2
+    first = items[0]
+    q = dict(first.identity.qualifiers)
+    assert first.identity.family == "auto" and first.identity.measure == "apr"
+    assert (q["model_year_start"], q["model_year_end"], q["term"]) == ("2024", "2027", "60 month")
+    assert q["rate_type"] == "as low as" and q["program"] == "auto loan"
+    assert first.dates.effective_on == "2026-08-31"
+    assert ("source_role", "page_title", "product_rate_table") in first.qualifier_provenance
+    assert all("illustrative" not in c.evidence for c in items)
+
+
+def test_calculator_header_mismatch_requires_apr_in_each_cell():
+    body = ("# Auto Loan Calculator\nAuto Loan Rates\n"
+            "| Account Type | Balance Tier | Annual Percentage Yield |\n"
+            "| --- | --- | --- |\n"
+            "| 2023–26 Model Year | 60 Months | 5.34% APR |\n"
+            "| 2023–26 Model Year | 72 Months | 5.44% |\n"
+            "Rates are effective as of 01/01/2026.\n")
+    notes = []
+    items = extract_claims(page(body, title="Vehicle Affordability Calculator"), "one", "2026-09-28", notes)
+    assert len(items) == 1 and items[0].identity.measure == "apr"
+    assert dict(items[0].identity.qualifiers)["rate_type"] == "quoted"
+    assert ("source_role", "page_title", "calculator_rate_table") in items[0].qualifier_provenance
+    assert sum(note.reason == "auto_header_cell_measure_mismatch" for note in notes) == 2
+    assert not any(c.identity.measure == "apy" for c in items)
+
+
+def test_ambiguous_auto_and_motorcycle_label_needs_explicit_auto_context():
+    body = ("# Vehicle Rates\nAuto & Motorcycle Loans\n"
+            "| Loan Program | Term | Annual Percentage Rate |\n| --- | --- | --- |\n"
+            "| 2024-27 Model Year | 60 Months | 5.39% APR |\n")
+    assert not any(c.identity.family == "auto" for c in claims(body, title="Vehicle Loans"))
+
+
+def test_fee_conditions_are_attached_and_incomplete_fee_is_rejected():
+    body = ("## Rate and Fee Schedule\nEffective February 17, 2025\n"
+            "| Deposit Services Consumer | Col2 | Col3 | Col4 |\n"
+            "| --- | --- | --- | --- |\n"
+            "| Consumer overdrafts (paid items) | $30.00 per item. No fee if transaction is less than $5.00. Maximum charge of one fee per day. | | |\n"
+            "| Consumer overdrafts (other) | $30.00 per item | | |\n"
+            "| Deposit Services Business | | | |\n"
+            "| Business overdrafts (paid items) | $30.00 per item. No fee if transaction is less than $5.00. Maximum charge of one fee per day. | | |\n")
+    notes = []
+    items = extract_claims(page(body, title="Fee Schedule"), "one", "2026-09-28", notes)
+    assert len(items) == 2
+    assert {dict(c.identity.qualifiers)["account_scope"] for c in items} == {"consumer", "business"}
+    assert all(dict(c.identity.qualifiers)["daily_cap"] == "one" for c in items)
+    assert all(dict(c.identity.qualifiers)["transaction_threshold"] == "5.00" for c in items)
+    assert all(dict(c.identity.qualifiers)["exemption"] == "transactions below threshold" for c in items)
+    assert all(c.value.unit == "USD" and c.dates.effective_on == "2025-02-17" for c in items)
+    assert any(note.reason == "incomplete_fee_conditions" for note in notes)
+
+
+def test_branch_schedule_retains_service_day_times_and_status_without_inferred_effective_date():
+    body = ("April 19, 2024\n# Cedar Branch\n**Lobby**\n"
+            "Monday-Friday: 8:30 a.m.–5:30 p.m.\nSaturday: 9 a.m.–noon\nSunday: Closed\n"
+            "**Drive-up**\nMonday-Friday: 8 a.m.–6 p.m.\nSunday: ATM only\n"
+            "For other questions, call us.\nMonday: 7 a.m.–7 p.m.\n"
+            "# Other services\nMonday: 7 a.m.–7 p.m.\n")
+    items = [c for c in claims(body, title="Branch reopening") if c.identity.family == "branch"]
+    assert len(items) == 5
+    assert {(dict(c.identity.qualifiers)["service"], dict(c.identity.qualifiers)["day"])
+            for c in items} == {("lobby", "monday-friday"), ("lobby", "saturday"),
+                               ("lobby", "sunday"), ("drive-up", "monday-friday"),
+                               ("drive-up", "sunday")}
+    assert {c.value.value for c in items} >= {"08:30-17:30", "closed", "atm only"}
+    assert all(c.dates.published_on == "2024-04-19" and c.dates.effective_on is None for c in items)
+
+
+def test_real_auto_tables_keep_apr_and_header_mismatch_evidence():
+    product, meta = _snapshot_page_with("2024-27 Model Year", "Annual Percentage Rate (As Low As)")
+    product_claims = [c for c in extract_claims(product, meta["snapshot_id"], meta["taken_on"])
+                      if c.identity.family == "auto"]
+    assert product_claims and all(c.identity.measure == "apr" for c in product_claims)
+    calculator, meta = _snapshot_page_with("2023–26 Model Year", "| Account Type | Balance Tier | Annual Percentage Yield |")
+    notes = []
+    calculator_claims = [c for c in extract_claims(calculator, meta["snapshot_id"], meta["taken_on"], notes)
+                         if c.identity.family == "auto"]
+    assert calculator_claims and not any(c.identity.family == "deposit" and "model year" in c.evidence.lower()
+                                         for c in extract_claims(calculator, meta["snapshot_id"], meta["taken_on"]))
+    assert any(note.reason == "auto_header_cell_measure_mismatch" for note in notes)
+    assert all(c.value.raw in c.evidence and "apr" in c.evidence.lower() for c in calculator_claims)
+
+
+def test_real_fee_and_branch_claims_keep_conditions_and_provenance():
+    fee_page, meta = _snapshot_page_with("|Consumer overdrafts (paid items)|", "Maximum charge of one fee per day")
+    fees = [c for c in extract_claims(fee_page, meta["snapshot_id"], meta["taken_on"])
+            if c.identity.family == "fee"]
+    overdrafts = [c for c in fees if "overdraft" in c.identity.subject]
+    assert overdrafts
+    assert all(dict(c.identity.qualifiers).get("daily_cap") == "one"
+               and dict(c.identity.qualifiers).get("transaction_threshold") for c in overdrafts)
+    assert all(c.evidence in fee_page.markdown for c in overdrafts)
+    branch_page, meta = _snapshot_page_with("The Platteville Dupaco branch is located", "**Drive-up**")
+    branches = [c for c in extract_claims(branch_page, meta["snapshot_id"], meta["taken_on"])
+                if c.identity.family == "branch"]
+    assert {c.value.value for c in branches} >= {"closed", "atm only"}
+    assert all(c.dates.effective_on is None and c.url == branch_page.url for c in branches)
+
+
 def _snapshot_page_with(*fragments):
     root = Path(__file__).resolve().parents[1] / "snapshots"
     for folder in sorted(root.iterdir(), reverse=True):

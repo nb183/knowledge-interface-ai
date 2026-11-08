@@ -6,6 +6,7 @@ questions. Unknown validity bounds remain unknown.
 from __future__ import annotations
 
 import hashlib
+import html
 import re
 from dataclasses import dataclass
 from datetime import date
@@ -23,6 +24,9 @@ PERCENT_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)\s*%")
 COUNT_RE = re.compile(r"\b(\d[\d,]*)\s+branch office locations\b", re.I)
 VTO_RE = re.compile(r"\b(\d[\d,]*)\s+(?:Dupaco\s+)?employees\b.*\bVolunteer Time Off\b", re.I)
 HOUR_RE = re.compile(r"\b\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)", re.I)
+MODEL_YEAR_RE = re.compile(r"^(20\d{2})\s*[-–]\s*(\d{2}|20\d{2})\s+model years?$", re.I)
+OLDER_MODEL_RE = re.compile(r"^(20\d{2})\s+model years?\s*\(and older\)$", re.I)
+MONEY_RE = re.compile(r"\$\s*(\d[\d,]*(?:\.\d{1,2})?)")
 
 
 def parse_date(text: str) -> str | None:
@@ -216,6 +220,193 @@ def _claim(identity: FactIdentity, value: TypedValue, dates: ClaimDates,
                  qualifier_provenance)
 
 
+def _auto_claims(page, snapshot_id, base, section, label, headers, table, effective,
+                 expires, diagnostics):
+    """Accept only an explicitly labelled auto model-year APR table."""
+    nearby = " ".join(page.markdown.splitlines()[max(0, table[0][0] - 6):table[0][0] - 1]).lower()
+    auto_context = "auto loan" in label or ("auto & motorcycle" in label and "auto loan rates" in nearby)
+    if (len(headers) != 3 or headers[1] not in ("term", "balance tier")
+            or not auto_context
+            or not any("model year" in cells[0].lower() for _, _, cells in table[2:] if cells)):
+        return None
+    header = headers[2]
+    header_apr = "annual percentage rate" in header or re.search(r"\bapr\b", header)
+    header_apy = "annual percentage yield" in header or re.search(r"\bapy\b", header)
+    if not header_apr and not header_apy:
+        return ()
+    role = ("calculator_rate_table" if "calculator" in page.title.lower() else
+            "product_rate_table" if re.search(r"auto|motorcycle", page.title, re.I) else
+            "dedicated_rate_sheet" if re.search(r"\brates?\b", page.title, re.I) else
+            "campaign_rate_table" if re.search(r"\b(?:offer|promotion|switch|cash back)\b", page.title, re.I) else
+            "other_rate_table")
+    found = []
+    for number, evidence, cells in table[2:]:
+        if len(cells) != 3:
+            if diagnostics is not None:
+                diagnostics.append(ExtractionDiagnostic(page.url, number, "irregular_auto_row", evidence))
+            continue
+        model, term, raw = cells
+        years = MODEL_YEAR_RE.fullmatch(normalize(model).replace("–", "-"))
+        older = OLDER_MODEL_RE.fullmatch(normalize(model))
+        months = re.fullmatch(r"(\d{1,3})\s+months?", normalize(term).replace("\xa0", " "))
+        rate = PERCENT_RE.search(raw)
+        cell_apr = bool(re.search(r"\bapr\b", raw, re.I))
+        if not (years or older) or not months or not rate or len(PERCENT_RE.findall(raw)) != 1:
+            if diagnostics is not None:
+                diagnostics.append(ExtractionDiagnostic(page.url, number, "ambiguous_auto_row", evidence))
+            continue
+        if header_apy:
+            if diagnostics is not None:
+                diagnostics.append(ExtractionDiagnostic(page.url, number, "auto_header_cell_measure_mismatch", evidence))
+            if not cell_apr:
+                continue
+        elif not header_apr or not cell_apr and role == "calculator_rate_table":
+            if diagnostics is not None:
+                diagnostics.append(ExtractionDiagnostic(page.url, number, "auto_apr_not_explicit", evidence))
+            continue
+        start = int(years.group(1)) if years else None
+        end = (int(years.group(2)) if len(years.group(2)) == 4 else
+               int(years.group(1)[:2] + years.group(2))) if years else int(older.group(1))
+        if start is not None and (end < start or end - start > 15):
+            continue
+        identity = FactIdentity.make("auto", "auto loan", "apr", program="auto loan",
+                                    term=f"{months.group(1)} month", model_year_start=str(start) if start else "",
+                                    model_year_end=str(end), model_year_relation="and older" if older else "range",
+                                    rate_type="as low as" if "as low as" in header else "quoted")
+        dates = ClaimDates(base.snapshot_on, base.fetched_at, base.published_on, effective, expires)
+        provenance = (("model_year", "row", model), ("term", "row", term),
+                      ("measure", "cell" if header_apy else "header", raw if header_apy else header),
+                      ("source_role", "page_title", role))
+        value = _number(rate.group(0), "percent")
+        found.append(_claim(identity, value, dates, snapshot_id, page,
+                            section + " > " + label if label else section,
+                            evidence, number, "auto_apr", provenance))
+    return tuple(found)
+
+
+def _fee_claims(page, snapshot_id, base, section, headers, table, diagnostics):
+    """Extract one fee amount only when its scope and conditions travel with it."""
+    if not headers or not headers[0].startswith("deposit services"):
+        return None
+    effective = next((parse_date(line) for line in page.markdown.splitlines()[:12]
+                      if re.search(r"\beffective\b", line, re.I) and parse_date(line)), None)
+    tax_note = next((line for line in page.markdown.splitlines()
+                     if re.search(r"\*\s*sales tax may apply", line, re.I)), "")
+    scope = "consumer" if "consumer" in headers[0] else "business" if "business" in headers[0] else ""
+    found = []
+    for number, evidence, cells in table[2:]:
+        cells = ([cell.strip() for cell in evidence[1:-1].split("|")]
+                 if evidence.startswith("|") else cells)
+        if len(cells) != len(headers) or not cells[0]:
+            continue
+        label = normalize(html.unescape(html.unescape(cells[0])))
+        if not any(cells[1:]):
+            if "deposit services business" in label:
+                scope = "business"
+            elif "deposit services consumer" in label:
+                scope = "consumer"
+            continue
+        if not scope or any(cells[2:]):
+            continue
+        amounts = MONEY_RE.findall(cells[1])
+        if not amounts or len(amounts) > 2:
+            continue
+        detail = normalize(html.unescape(html.unescape(cells[1])))
+        if "*" in cells[1] and not tax_note:
+            if diagnostics is not None:
+                diagnostics.append(ExtractionDiagnostic(page.url, number, "unresolved_fee_footnote", evidence))
+            continue
+        threshold = re.search(r"less than\s*\$\s*(\d+(?:\.\d{1,2})?)", detail)
+        daily = re.search(r"maximum charge of\s+(one|\d+)\s+fee per day", detail)
+        free = re.search(r"after\s+(\d+)\s+free per month", label)
+        exemption = re.search(r"free if\s+([^)]*)", detail)
+        if "overdraft" in label and (not threshold or not daily):
+            if diagnostics is not None:
+                diagnostics.append(ExtractionDiagnostic(page.url, number, "incomplete_fee_conditions", evidence))
+            continue
+        if len(amounts) > 1 and not (threshold and amounts[1] == threshold.group(1)):
+            if diagnostics is not None:
+                diagnostics.append(ExtractionDiagnostic(page.url, number, "ambiguous_fee_amounts", evidence))
+            continue
+        unit = next((name for name in ("per item", "per month", "per hour", "per roll",
+                                       "per transaction", "per inquiry", "each") if name in detail), "flat")
+        identity = FactIdentity.make("fee", label, "amount", account_scope=scope, unit=unit,
+                                    transaction_threshold=threshold.group(1) if threshold else "",
+                                    daily_cap=daily.group(1) if daily else "",
+                                    free_transactions=free.group(1) if free else "",
+                                    sales_tax="may apply" if "*" in cells[1] else "",
+                                    exemption=("transactions below threshold" if threshold else
+                                               exemption.group(1) if exemption else ""))
+        dates = ClaimDates(base.snapshot_on, base.fetched_at, base.published_on, effective)
+        amount = Decimal(amounts[0].replace(",", ""))
+        value = TypedValue("money", amount, "USD", "$" + amounts[0])
+        provenance = (("amount", "row", cells[1]), ("account_scope", "table", scope),
+                      ("conditions", "row", cells[0] + " " + cells[1]))
+        if "*" in cells[1]:
+            provenance += (("sales_tax", "footnote", tax_note),)
+        found.append(_claim(identity, value, dates, snapshot_id, page,
+                            section + " > " + scope + " fees", evidence, number, "fee_amount", provenance))
+    return tuple(found)
+
+
+def _fee_prose_claims(page, snapshot_id, base, diagnostics):
+    """Read the same labelled deposit-fee schedule when the PDF is plain text."""
+    lines = page.markdown.splitlines()
+    if (not any("rate and fee schedule" in normalize(line) for line in lines[:8])
+            or any(line.lstrip().startswith("|") for line in lines[:15])):
+        return ()
+    rows = [(0, "", []), (0, "", [])]
+    active = False
+    for pos, line in enumerate(lines):
+        label = normalize(line)
+        if label == "deposit services consumer":
+            active = True
+            continue
+        if not active:
+            continue
+        if label == "teller and cash handling service charges":
+            break
+        if label == "deposit services business":
+            rows.append((pos + 1, line, [line, ""]))
+            continue
+        amount = MONEY_RE.search(line)
+        if not amount:
+            continue
+        detail = line[amount.start():]
+        if pos + 1 < len(lines) and re.match(r"\s*\*\s*you will not be charged", lines[pos + 1], re.I):
+            detail += " " + lines[pos + 1]
+        rows.append((pos + 1, line, [line[:amount.start()].strip(), detail]))
+    return _fee_claims(page, snapshot_id, base, "rate and fee schedule",
+                       ["deposit services consumer", "value"], rows, diagnostics) or ()
+
+
+def _clock(text: str) -> str | None:
+    if normalize(text) == "noon":
+        return "12:00"
+    match = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?", text.strip(), re.I)
+    if not match:
+        return None
+    hour = int(match.group(1)) % 12 + (12 if match.group(3).lower() == "p" else 0)
+    return f"{hour:02d}:{int(match.group(2) or '0'):02d}"
+
+
+def _schedule_value(line: str) -> tuple[str, tuple[tuple[str, str, str], ...]] | None:
+    text = normalize(re.sub(r"^.*?\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b\s*"
+                            r"(?:[-–]\s*(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))?\s*:",
+                            "", line, flags=re.I))
+    if text in ("closed", "atm only"):
+        return text, (("status", "row", text),)
+    clock = r"(?:\d{1,2}(?::\d{2})?\s*[ap]\.?(?:m\.?)?|noon)"
+    match = re.fullmatch(rf"\s*({clock})\s*[-–]\s*({clock})\s*", text, re.I)
+    if not match:
+        return None
+    opening, closing = _clock(match.group(1)), _clock(match.group(2))
+    if opening is None or closing is None or opening >= closing:
+        return None
+    return f"{opening}-{closing}", (("opens", "row", match.group(1)),
+                                     ("closes", "row", match.group(2)))
+
+
 def _explicit_scope(page, section: str, subject: str) -> tuple[str, str, str] | None:
     """Return a scope only when the row, section, or page title says it."""
     for origin, evidence in (("row", subject), ("section", section), ("title", page.title)):
@@ -232,10 +423,11 @@ def extract_claims(page, snapshot_id: str, snapshot_on: str,
     lines = page.markdown.splitlines()
     published = _publication(lines)
     base = ClaimDates(snapshot_on, page.fetched_at, published)
-    claims = []
+    claims = list(_fee_prose_claims(page, snapshot_id, base, diagnostics))
     headings: list[tuple[int, str]] = []
     section_label = ""
     branch = service = ""
+    branch_schedule = False
     i = 0
     while i < len(lines):
         raw = lines[i]
@@ -248,6 +440,7 @@ def extract_claims(page, snapshot_id: str, snapshot_on: str,
             service = ""
             if level <= 3:
                 branch = ""
+                branch_schedule = False
         section = " > ".join(h for _, h in headings)
         if line.startswith("|") and line.endswith("|"):
             start = i
@@ -268,6 +461,15 @@ def extract_claims(page, snapshot_id: str, snapshot_on: str,
                 if len(set(headers)) != len(headers):
                     if diagnostics is not None:
                         diagnostics.append(ExtractionDiagnostic(page.url, table[0][0], "duplicate_table_header", table[0][1]))
+                    continue
+                auto = _auto_claims(page, snapshot_id, base, section, section_label,
+                                    headers, table, effective, expires, diagnostics)
+                if auto is not None:
+                    claims.extend(auto)
+                    continue
+                fees = _fee_claims(page, snapshot_id, base, section, headers, table, diagnostics)
+                if fees is not None:
+                    claims.extend(fees)
                     continue
                 if not any(rate_columns):
                     continue
@@ -386,28 +588,48 @@ def extract_claims(page, snapshot_id: str, snapshot_on: str,
         if line.lower().endswith("branch") and len(line) < 60:
             branch = normalize(line.lstrip("# "))
             service = ""
+            branch_schedule = True
         named_branch = re.search(
             r"\b(?:The\s+)?([A-Z][A-Za-z-]+(?:\s+(?!Dupaco\b)[A-Z][A-Za-z-]+){0,2})\s+"
             r"(?:Dupaco\s+)?branch\s+(?:is located|hours|is open)\b", raw)
+        if not named_branch:
+            named_branch = re.search(
+                r"\bphone number for the\s+([A-Z][A-Za-z-]+(?:\s+[A-Z][A-Za-z-]+){0,2})\s+branch\b",
+                raw)
         if named_branch:
             branch = normalize(named_branch.group(1) + " branch")
             service = ""
+            branch_schedule = "branch hours" in line.lower()
+        if re.search(r"\bbranch hours are\s*:", line, re.I) and branch:
+            branch_schedule = True
+        if re.search(r"\babout dupaco community credit union\b", line, re.I):
+            branch_schedule = False
         address = re.search(r"\b\d{2,6}\s+[^,]+,\s*[^,]+,\s*[A-Z]{2},?\s*\d{5}\b", line)
         if branch in ("branch", "dupaco branch") and address:
             branch = normalize(address.group(0))
         label = re.match(r"^(?:\*\*|__)?(Lobby|Drive-up|Drive up)(?:\*\*|__)?\b", line, re.I)
         if label:
             service = normalize(label.group(1)).replace("drive up", "drive-up")
-        if branch and service and HOUR_RE.search(line):
+        if branch and service and branch_schedule:
             day = re.search(
                 r"\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)"
                 r"(?:\s*[-–]\s*(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday))?\b",
                 line, re.I)
             if day:
                 day_label = day.group(1) + ("-" + day.group(2) if day.group(2) else "")
-                identity = FactIdentity.make("branch", branch, "hours", service=service, day=day_label)
-                claims.append(_claim(identity, TypedValue("schedule", normalize(line), "hours", line),
-                                     base, snapshot_id, page, section, raw, i + 1, "hours"))
+                schedule = _schedule_value(line)
+                if schedule:
+                    identity = FactIdentity.make("branch", branch, "hours", service=service, day=day_label)
+                    claims.append(_claim(identity, TypedValue("schedule", schedule[0], "hours", line),
+                                         base, snapshot_id, page, section, raw, i + 1, "hours",
+                                         (("branch", "page", branch), ("service", "label", service),
+                                          ("day", "row", day_label)) + schedule[1]))
+        if (branch_schedule and line and not line.startswith("#") and not label
+                and not re.match(r"^(?:\*\*)?(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)\b",
+                                 line, re.I)
+                and "branch hours" not in line.lower()):
+            branch_schedule = False
+            service = ""
         count = COUNT_RE.search(line)
         if count:
             value = _number(count.group(1), "count")
