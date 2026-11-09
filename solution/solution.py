@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(next(d / "harness" for d in Path(__file__).resolve().parents
                              if (d / "harness" / "contract.py").exists())))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from contract import Answer, Conflict, Source  # noqa: E402
+from contract import Answer, Source  # noqa: E402
 from facts import FactIndex  # noqa: E402
 from answer_adapter import propose  # noqa: E402
 from resolver import TemporalResolver  # noqa: E402
@@ -685,6 +685,7 @@ class LexicalKnowledge:
         self.promotion_diagnostics = deque(maxlen=64)
         self.conflict_shadow_diagnostics = deque(maxlen=2)
         self.conflict_shadow_errors = deque(maxlen=2)
+        self.public_conflict_shadow_diagnostics = deque(maxlen=2)
         self._shadow_resolver = None
 
     def ingest(self, snapshot):
@@ -798,46 +799,24 @@ class LexicalKnowledge:
         return Answer(body, sources)
 
     def conflicts(self):
-        # Compare the same labelled fact or table row on the same URL.
-        observed = defaultdict(dict)
-        for index in self.snapshots:
-            for p in index.passages:
-                if p.kind == "table" and p.row_key:
-                    key = (p.url, p.heading.lower(), p.row_key.lower())
-                elif p.kind == "text" and ":" in p.text and re.search(r"\d+(?:\.\d+)?%", p.text):
-                    key = (p.url, p.heading.lower(), p.text.split(":", 1)[0].lower())
-                else:
-                    continue
-                observed[key][index.snapshot_id] = p
-        out = []
-        for (url, heading, row), by_snap in observed.items():
-            variants = defaultdict(list)
-            for sid, p in by_snap.items():
-                values = tuple(re.findall(r"\d+(?:\.\d+)?%", p.text))
-                if not values and "fee" in heading:
-                    values = tuple(re.findall(r"\$\s*\d+(?:,\d{3})*(?:\.\d+)?", p.text))
-                if values:
-                    variants[values].append(p)
-            if len(variants) < 2:
-                continue
-            latest = next((by_snap[s.snapshot_id] for s in reversed(self.snapshots) if s.snapshot_id in by_snap), None)
-            if latest is None:
-                continue
-            values = [", ".join(v) for v in variants]
-            sources = [Source(ps[-1].url, ps[-1].snapshot_id, ps[-1].text[:220]) for ps in variants.values()]
-            winner = ", ".join(re.findall(r"\d+(?:\.\d+)?%", latest.text))
-            out.append(Conflict(f"{heading}: {row}", values, sources, winner,
-                                "Most recent full website snapshot"))
         try:
             try:
-                from .conflict_adapter import analyze
+                from .conflict_adapter import analyze, public_conflicts
             except ImportError:
-                from conflict_adapter import analyze
+                from conflict_adapter import analyze, public_conflicts
             resolver = TemporalResolver([s.fact_index for s in self.snapshots])
-            self.conflict_shadow_diagnostics.append(analyze(self.snapshots, resolver))
+            report = analyze(self.snapshots, resolver)
+            self.conflict_shadow_diagnostics.append(report)
+            validated = public_conflicts(report, self.snapshots)
+            self.public_conflict_shadow_diagnostics.append(validated)
+            if validated.error or validated.rejected:
+                self.conflict_shadow_errors.append(validated.error or
+                                                   f"validation_rejected:{len(validated.rejected)}")
+                return []
+            return list(validated.conflicts)
         except Exception as exc:
             self.conflict_shadow_errors.append(f"{type(exc).__name__}: {exc}")
-        return out
+            return []
 
 
 def build():

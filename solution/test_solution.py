@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "harness"))
 from contract import Answer, Page, Snapshot
@@ -274,10 +275,28 @@ def test_fact_inventory_is_built_without_changing_answer_or_conflict_paths():
     assert ks.conflicts() == []
 
 
-def test_conflict_shadow_hook_keeps_public_output_and_records_report():
+def test_public_conflict_hook_returns_validated_empty_result():
     ks = build()
     ks.ingest(Snapshot("one", "2026-01-01", [page(
         "https://example.test/rates", "# Rates\n| Product | APY |\n| --- | --- |\n| Savings | 1.00% |")]))
     assert ks.conflicts() == []
     assert len(ks.conflict_shadow_diagnostics) == 1
+    assert len(ks.public_conflict_shadow_diagnostics) == 1
+    assert ks.public_conflict_shadow_diagnostics[0].conflicts == ()
+    assert ks.public_conflict_shadow_diagnostics[0].error is None
     assert not ks.conflict_shadow_errors
+
+
+def test_public_conflicts_fail_closed_with_explicit_diagnostics():
+    from solution.conflict_adapter import PublicConflictResult
+
+    ks = build()
+    ks.ingest(Snapshot("one", "2026-01-01", [page(
+        "https://example.test/rates", "# Rates\n| Product | APY |\n| --- | --- |\n| Savings | 1.00% |")]))
+    with patch("solution.conflict_adapter.public_conflicts",
+               return_value=PublicConflictResult((), (("one", "unverified_row"),))):
+        assert ks.conflicts() == []
+    assert ks.conflict_shadow_errors[-1] == "validation_rejected:1"
+    with patch("solution.conflict_adapter.analyze", side_effect=RuntimeError("adapter failed")):
+        assert ks.conflicts() == []
+    assert "adapter failed" in ks.conflict_shadow_errors[-1]

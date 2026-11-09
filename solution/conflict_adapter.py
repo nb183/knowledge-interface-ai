@@ -1,25 +1,23 @@
-"""Shadow-only conflict proposals from source-verified, snapshot-scoped facts.
-
-The public conflicts() contract remains owned by solution.py. Nothing here is
-used to answer member questions or to replace its public conflict entries.
-"""
+"""Source-verified conflict discovery and validated public conflict entries."""
 from __future__ import annotations
 
 import re
+import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
+
+# Match the top-level contract module loaded by the official harness.
+sys.path.insert(0, str(next(d / "harness" for d in Path(__file__).resolve().parents
+                             if (d / "harness" / "contract.py").exists())))
+from contract import Conflict, Source
 
 try:
-    from harness.contract import Conflict, Source
-except ImportError:  # The harness loads solution.py with its own path.
-    from contract import Conflict, Source
-
-try:
-    from .facts import Claim, FactIdentity, MODEL_YEAR_RE, OLDER_MODEL_RE, normalize, temporal_relationship
+    from .facts import Claim, FactIdentity, MODEL_YEAR_RE, OLDER_MODEL_RE, _table_dates, normalize, temporal_relationship
     from .resolver import TemporalResolver, qualifier_match
 except ImportError:
-    from facts import Claim, FactIdentity, MODEL_YEAR_RE, OLDER_MODEL_RE, normalize, temporal_relationship
+    from facts import Claim, FactIdentity, MODEL_YEAR_RE, OLDER_MODEL_RE, _table_dates, normalize, temporal_relationship
     from resolver import TemporalResolver, qualifier_match
 
 
@@ -41,6 +39,14 @@ class ShadowConflictReport:
     cases: tuple[ShadowCase, ...]
     proposed: tuple[Conflict, ...]
     counts: tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PublicConflictResult:
+    """An empty validated result is distinct from a failed validation."""
+    conflicts: tuple[Conflict, ...]
+    rejected: tuple[tuple[str, str], ...]
+    error: str | None = None
 
 
 def _number(text: str) -> str:
@@ -98,17 +104,41 @@ def _row_conditions(row: dict[str, str]) -> tuple[tuple[str, str], ...]:
                         if key in relevant and value.strip()))
 
 
-def _disclosures(claim: Claim, page) -> dict[str, str]:
+def _disclosure_text(claim: Claim, page) -> str:
     lines = page.markdown.splitlines()
     pos = claim.line
     while pos < len(lines) and lines[pos].strip().startswith("|"):
         pos += 1
     following = []
     for line in lines[pos:pos + 12]:
-        if line.lstrip().startswith(("#", "|")):
+        plain = line.strip().lower()
+        if (plain.startswith(("#", "|")) or
+                re.fullmatch(r"(?:home loans?(?:\s*[-–:]\s*(?:purchase|refinance|cash[- ]out refinance|home equity refinance))?"
+                             r"|home equity refinance|cash[- ]out refinance)", plain)):
             break
         following.append(line)
-    text = " ".join(following).lower()
+    return " ".join(following).lower()
+
+
+def _disclosure_scope(claim: Claim, page) -> str | None:
+    text = _disclosure_text(claim, page)
+    scopes = set()
+    if re.search(r"\bpurchase(?: transaction)?\b", text):
+        scopes.add("purchase")
+    if re.search(r"\bcash[- ]out refinance\b", text):
+        scopes.add("cash_out_refinance")
+    if re.search(r"\bhome[- ]equity refinance\b", text):
+        scopes.add("home_equity_refinance")
+    if re.search(r"\brate[/ -]?term refinance\b", text):
+        scopes.add("refinance")
+    elif re.search(r"\brefinance\b", text) and not scopes.intersection(
+            {"refinance", "cash_out_refinance", "home_equity_refinance"}):
+        scopes.add("refinance_unspecified")
+    return next(iter(scopes)) if len(scopes) == 1 else "ambiguous" if scopes else None
+
+
+def _disclosures(claim: Claim, page) -> dict[str, str]:
+    text = _disclosure_text(claim, page)
     patterns = {
         "credit_score": r"minimum credit score of\s*(\d+)",
         "ltv": r"(\d+(?:\.\d+)?)%\s*(?:loan[- ]to[- ]value|\(ltv\))",
@@ -138,24 +168,32 @@ def _conditions_match(left: Claim, right: Claim, left_row, right_row, left_page,
     return required <= a.keys() and required <= b.keys() and a == b
 
 
-def _section_scope(claim: Claim, row: dict[str, str]) -> str | None:
+def _section_scope(claim: Claim, row: dict[str, str], page) -> str | None:
     """Read transaction scope from the actual section and its verified row."""
     if claim.identity.family != "mortgage":
         return None
     heading = claim.section.rsplit(" > ", 1)[-1].lower()
     row_label = next(iter(row.values()), "").lower()
     transaction = dict(claim.identity.qualifiers).get("transaction")
+    disclosed = _disclosure_scope(claim, page)
+    if disclosed == "ambiguous":
+        return None
     if transaction == "purchase":
-        if not row_label.startswith("purchase:") or "refinance" in heading:
+        if (not row_label.startswith("purchase:") or
+                not re.fullmatch(r"home loans?(?:\s*[-–:]\s*purchase)?|purchase", heading) or
+                disclosed not in (None, "purchase")):
             return None
-        return "purchase" if "home loan" in heading or "purchase" in heading else None
+        return "purchase"
     if transaction != "refinance" or not row_label.startswith("refinance:"):
         return None
     if "cash-out refinance" in heading or "cash out refinance" in heading:
-        return "cash_out_refinance"
+        return "cash_out_refinance" if disclosed in (None, "cash_out_refinance") else None
     if "home equity refinance" in heading:
-        return "home_equity_refinance"
+        return "home_equity_refinance" if disclosed in (None, "home_equity_refinance") else None
     if "home loan refinance" in heading:
+        return "refinance" if disclosed in (None, "refinance") else None
+    if (re.fullmatch(r"home loans?\s*[-–:]\s*refinance", heading)
+            and disclosed == "refinance"):
         return "refinance"
     return None
 
@@ -211,8 +249,8 @@ def classify_snapshot_pair(left: Claim, right: Claim, index) -> ShadowCase:
         return ShadowCase("unresolved", index.snapshot_id, claims, "unverified_source_row")
     (left_row, left_page), (right_row, right_page) = evidence
     if left.identity.family == "mortgage":
-        left_scope = _section_scope(left, left_row)
-        right_scope = _section_scope(right, right_row)
+        left_scope = _section_scope(left, left_row, left_page)
+        right_scope = _section_scope(right, right_row, right_page)
         if left_scope is None or right_scope is None or left_scope != right_scope:
             return ShadowCase("unresolved", index.snapshot_id, claims,
                               "different_or_unknown_section_scope")
@@ -350,3 +388,84 @@ def analyze(indexes, resolver: TemporalResolver) -> ShadowConflictReport:
     counts = Counter(case.classification for case in cases)
     return ShadowConflictReport(tuple(cases), _deduplicate_proposals(cases),
                                 tuple(sorted(counts.items())))
+
+
+def _raw_table_dates(claim: Claim, page) -> tuple[str | None, str | None]:
+    lines = page.markdown.splitlines()
+    pos = claim.line - 1
+    if pos < 0 or pos >= len(lines) or lines[pos].strip() != claim.evidence.strip():
+        return None, None
+    end = pos + 1
+    while end < len(lines) and lines[end].strip().startswith("|"):
+        end += 1
+    return _table_dates(lines, end)
+
+
+def _validated_case(case: ShadowCase, index) -> ShadowCase | None:
+    if case.classification not in ("simultaneous", "stale_published") or len(case.claims) != 2:
+        return None
+    if case.snapshot_id != index.snapshot_id or any(c.snapshot_id != index.snapshot_id for c in case.claims):
+        return None
+    for claim in case.claims:
+        verified = _verified(claim, index)
+        if verified is None or not _complete(claim.identity):
+            return None
+        _, page = verified
+        if _raw_table_dates(claim, page) != (claim.dates.effective_on, claim.dates.expires_on):
+            return None
+    checked = classify_snapshot_pair(*case.claims, index)
+    if checked.classification != case.classification or checked.proposed is None:
+        return None
+    if case.proposed != checked.proposed:
+        return None
+    return checked
+
+
+def _public_group_key(case: ShadowCase):
+    claims = case.claims
+    return (case.snapshot_id, claims[0].identity, case.classification,
+            tuple((c.value.kind, str(c.value.value), c.dates.effective_on,
+                   c.dates.expires_on) for c in claims))
+
+
+def public_conflicts(report: ShadowConflictReport, indexes) -> PublicConflictResult:
+    """Build validated output; distinguish empty, rejected, and failed results."""
+    try:
+        by_snapshot = {index.snapshot_id: index for index in indexes}
+        groups = defaultdict(list)
+        rejected = []
+        for case in report.cases:
+            if case.proposed is None:
+                continue
+            index = by_snapshot.get(case.snapshot_id)
+            checked = _validated_case(case, index) if index is not None else None
+            if checked is None:
+                rejected.append((case.snapshot_id, "public_evidence_validation_failed"))
+                continue
+            groups[_public_group_key(checked)].append(checked)
+        output = []
+        for key in sorted(groups, key=repr):
+            cases = groups[key]
+            representative = cases[0]
+            citations = []
+            seen = set()
+            for case in cases:
+                for claim in case.claims:
+                    citation = (claim.value.raw, claim.url, claim.snapshot_id, claim.evidence)
+                    if citation not in seen:
+                        seen.add(citation)
+                        citations.append(citation)
+            citations.sort()
+            reason = representative.proposed.reason
+            if representative.classification == "stale_published":
+                older, newer = representative.claims
+                reason = (f"Older {_source_role(older)} effective {older.dates.effective_on} remains published "
+                          f"beside {_source_role(newer)} effective {newer.dates.effective_on}; "
+                          "the later source supplies current guidance, with no inferred expiration date.")
+            output.append(Conflict(representative.proposed.topic,
+                                   [value for value, _, _, _ in citations],
+                                   [Source(url, sid, quote) for _, url, sid, quote in citations],
+                                   representative.proposed.resolution, reason))
+        return PublicConflictResult(tuple(output), tuple(rejected))
+    except Exception as exc:
+        return PublicConflictResult((), (), f"{type(exc).__name__}: {exc}")

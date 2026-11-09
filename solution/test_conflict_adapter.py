@@ -2,14 +2,17 @@
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 from harness.contract import Page, Snapshot
 from harness.run_eval import load_snapshots
-from solution.conflict_adapter import (ShadowCase, _deduplicate_proposals, _key,
-                                       _proposal, analyze, classify_snapshot_pair)
+from solution.conflict_adapter import (ShadowCase, ShadowConflictReport, _deduplicate_proposals, _key,
+                                       _proposal, _disclosure_scope, _section_scope, _verified, analyze,
+                                       classify_snapshot_pair, public_conflicts)
 from solution.facts import Claim, ClaimDates, FactIdentity, TypedValue
 from solution.resolver import TemporalResolver
 from solution.solution import build
+from contract import Conflict as SubmissionConflict, Source as SubmissionSource
 
 
 def _site():
@@ -61,6 +64,12 @@ def test_shadow_is_deterministic_and_does_not_change_public_conflicts():
     site = _site()
     first = site.conflicts()
     report = site.conflict_shadow_diagnostics[-1]
+    validated = public_conflicts(report, site.snapshots)
+    assert first == list(validated.conflicts)
+    assert all(isinstance(entry, SubmissionConflict) and
+               all(isinstance(source, SubmissionSource) for source in entry.sources)
+               for entry in first)
+    assert all(len(entry.values) == len(entry.sources) and entry.reason for entry in first)
     assert site.conflicts() == first
     assert site.conflict_shadow_diagnostics[-1] == report
     assert not site.conflict_shadow_errors
@@ -97,6 +106,80 @@ def test_missing_or_ambiguous_refinance_scope_is_not_confirmed():
         assert result.rule == "different_or_unknown_section_scope"
         assert result.proposed is None
     assert classify_snapshot_pair(old, new, index).classification == "stale_published"
+
+
+def test_explicit_rate_term_disclosures_equate_refinance_heading_variants():
+    site = _site()
+    index = site.snapshots[-1]
+    claims = index.fact_index.claims
+    old = next(c for c in claims if c.identity.family == "mortgage" and c.identity.measure == "apr"
+               and c.section.endswith("home loan refinance")
+               and dict(c.identity.qualifiers).get("tier"))
+    new = next(c for c in claims if c.identity == old.identity
+               and c.section.endswith("home loans - refinance")
+               and c.dates.effective_on > old.dates.effective_on)
+    result = classify_snapshot_pair(old, new, index)
+    assert result.classification == "stale_published"
+    assert result.proposed.resolution == new.value.raw
+    assert result.proposed.sources[0].quote == old.evidence
+    assert result.proposed.sources[1].quote == new.evidence
+
+    row, _ = _verified(new, index)
+    assert _section_scope(new, row, SimpleNamespace(markdown="")) is None
+    for heading in ("home loans - cash-out refinance", "home loans - home equity refinance",
+                    "home loans - refinance options", "refinance"):
+        altered = replace(new, section="rates > " + heading)
+        rejected = classify_snapshot_pair(old, altered, index)
+        assert rejected.classification == "unresolved"
+        assert rejected.rule == "different_or_unknown_section_scope"
+
+
+def test_purchase_rows_with_refinance_disclosure_are_unresolved_in_copied_tables():
+    site = _site()
+    latest = site.snapshots[-1]
+    claims = latest.fact_index.claims
+    older = next(c for c in claims if c.identity.family == "mortgage"
+                 and c.identity.measure == "apr" and c.section.endswith("home loans")
+                 and dict(c.identity.qualifiers).get("transaction") == "purchase")
+    current = [c for c in claims if c.identity == older.identity
+               and c.dates.effective_on > older.dates.effective_on]
+    assert len({c.url for c in current}) == 2
+    for newer in current:
+        assert _disclosure_scope(newer, latest.pages[newer.url]) == "refinance"
+        case = classify_snapshot_pair(older, newer, latest)
+        assert case.classification == "unresolved"
+        assert case.rule == "different_or_unknown_section_scope"
+        assert case.proposed is None
+
+    earlier = site.snapshots[-2]
+    aligned = [c for c in earlier.fact_index.claims if c.identity == older.identity]
+    old = next(c for c in aligned if c.dates.effective_on == older.dates.effective_on)
+    new = next(c for c in aligned if c.dates.effective_on
+               and c.dates.effective_on > old.dates.effective_on)
+    assert _disclosure_scope(new, earlier.pages[new.url]) is None
+    assert classify_snapshot_pair(old, new, earlier).classification == "stale_published"
+
+
+def test_disclosure_scope_stops_at_next_section_and_rejects_mixed_scope():
+    site = _site()
+    index = site.snapshots[-1]
+    claim = next(c for c in index.fact_index.claims if c.identity.family == "mortgage"
+                 and c.section.endswith("home loans - purchase")
+                 and c.identity.measure == "apr")
+    row, _ = _verified(claim, index)
+    def page_with_footer(footer):
+        lines = [""] * (claim.line - 1) + [claim.evidence, "", footer, "", "Home Loans - Refinance",
+                                              "Rate/Term Refinance Transaction"]
+        return SimpleNamespace(markdown="\n".join(lines))
+    assert _disclosure_scope(claim, page_with_footer("Purchase transaction.")) == "purchase"
+    assert _section_scope(claim, row, page_with_footer("Purchase transaction.")) == "purchase"
+    assert _disclosure_scope(claim, page_with_footer("Purchase or rate/term refinance.")) == "ambiguous"
+    assert _section_scope(claim, row, page_with_footer("Purchase or rate/term refinance.")) is None
+    assert _disclosure_scope(claim, page_with_footer("Purchase or refinance.")) == "ambiguous"
+    assert _section_scope(claim, row, page_with_footer("Purchase or refinance.")) is None
+    assert _disclosure_scope(claim, page_with_footer("")) is None
+    assert _section_scope(claim, row, page_with_footer("Cash-out refinance transaction.")) is None
+    assert _section_scope(claim, row, page_with_footer("Home-equity refinance transaction.")) is None
 
 
 def _synthetic_claim(sid, url, value, effective, *, measure="interest_rate", transaction="purchase"):
@@ -229,3 +312,49 @@ def test_fee_and_branch_differences_stay_review_only_with_all_sources():
         assert len({claim.url for claim in cases[0].claims}) == 2
         assert all(claim.evidence in index.pages[claim.url].markdown for claim in cases[0].claims)
     assert report.proposed == ()
+
+
+def test_public_adapter_retains_copied_sources_and_value_alignment():
+    site = _site()
+    report = analyze(site.snapshots, TemporalResolver([s.fact_index for s in site.snapshots]))
+    result = public_conflicts(report, site.snapshots)
+    assert result.error is None and not result.rejected
+    assert len(result.conflicts) < len(report.proposed)
+    for entry in result.conflicts:
+        assert entry.values and len(entry.values) == len(entry.sources)
+        assert entry.reason
+        for value, source in zip(entry.values, entry.sources):
+            index = next(index for index in site.snapshots if index.snapshot_id == source.snapshot_id)
+            assert source.url in index.pages
+            assert source.quote in index.pages[source.url].markdown
+            assert value in source.quote
+        if entry.resolution is None:
+            assert len(set(entry.values)) > 1
+        else:
+            assert entry.resolution in entry.values
+    assert result == public_conflicts(report, site.snapshots)
+
+
+def test_public_adapter_rejects_tampered_dates_quotes_and_wrong_snapshot():
+    site = _site()
+    index = site.snapshots[-1]
+    case = next(c for c in analyze([index], TemporalResolver([index.fact_index])).cases
+                if c.classification == "stale_published")
+    altered = (
+        replace(case, claims=(replace(case.claims[0], dates=replace(
+            case.claims[0].dates, effective_on="2020-01-01")), case.claims[1])),
+        replace(case, claims=(replace(case.claims[0], evidence="| invented |"), case.claims[1])),
+        replace(case, snapshot_id="unknown"),
+    )
+    for bad in altered:
+        report = ShadowConflictReport((bad,), (case.proposed,), ())
+        result = public_conflicts(report, [index])
+        assert result.error is None and result.conflicts == () and len(result.rejected) == 1
+
+
+def test_public_adapter_distinguishes_empty_from_failure():
+    empty = ShadowConflictReport((), (), ())
+    assert public_conflicts(empty, []).error is None
+    assert public_conflicts(empty, []).conflicts == ()
+    failed = public_conflicts(empty, None)
+    assert failed.conflicts == () and failed.error
