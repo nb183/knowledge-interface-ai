@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "harness"))
 from contract import Answer, Page, Snapshot
-from solution.solution import (build, links, parse_request, passages,
+from solution.solution import (_membership_eligibility_answer, build, links, parse_request, passages,
                                qualifier_state, words)
 
 
@@ -300,3 +300,30 @@ def test_public_conflicts_fail_closed_with_explicit_diagnostics():
     with patch("solution.conflict_adapter.analyze", side_effect=RuntimeError("adapter failed")):
         assert ks.conflicts() == []
     assert "adapter failed" in ks.conflict_shadow_errors[-1]
+
+
+def test_membership_eligibility_assembles_one_section_with_selected_snapshot_context():
+    old = ("# Join\n\nYou can find us in the North and South regions.\n\n"
+           "### Who Can Join\n## Eligible to Join\n- You live or work within our [charter area](https://example.test/map).\n"
+           "- You have an immediate family member who's a member.\n\nApply online.")
+    new = old.replace("North and South", "East and West")
+    ks = build()
+    ks.ingest(Snapshot("old", "2026-01-01", [page("https://example.test/join", old, "Join")]))
+    ks.ingest(Snapshot("new", "2026-02-01", [page("https://example.test/join", new, "Join")]))
+    question = "Who is eligible for membership?"
+    earlier = ks.answer(question, as_of="2026-01-15")
+    current = ks.answer(question)
+    assert "live or work" in earlier.text and "family member" in earlier.text
+    assert "North and South" in earlier.text and "East and West" not in earlier.text
+    assert "East and West" in current.text and "North and South" not in current.text
+    assert all(source.snapshot_id == "old" and source.quote in old for source in earlier.sources)
+    assert all(source.snapshot_id == "new" and source.quote in new for source in current.sources)
+    assert earlier == ks.answer(question, as_of="2026-01-15")
+
+
+def test_membership_eligibility_needs_explicit_charter_condition():
+    ks = build()
+    ks.ingest(Snapshot("one", "2026-01-01", [page(
+        "https://example.test/join", "# Join\n## Eligible to Join\n- Ask us about membership.\n"
+        "You can find us in the North and South regions.", "Join")]))
+    assert _membership_eligibility_answer(ks.snapshots[0], "Who is eligible for membership?") is None

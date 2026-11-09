@@ -359,6 +359,49 @@ def parse_request(question):
     return RequestSpec("legacy", "", qualifiers)
 
 
+def _membership_eligibility_answer(index, question):
+    """Assemble an explicit eligibility section from one selected-snapshot page."""
+    lower = question.lower()
+    if (not re.search(r"\b(?:eligible|eligibility|qualify|who can join)\b", lower)
+            or not re.search(r"\b(?:member|membership|join)\b", lower)):
+        return None
+    seen = set()
+    for _, passage in index.search(question, limit=80):
+        if passage.url in seen:
+            continue
+        seen.add(passage.url)
+        page = index.pages.get(passage.url)
+        if page is None:
+            continue
+        lines = page.markdown.splitlines()
+        for heading, line in enumerate(lines):
+            if not re.match(r"^#{1,6}\s+.*\b(?:eligible to join|who can join)\b", line, re.I):
+                continue
+            bullets = []
+            for item in lines[heading + 1:heading + 16]:
+                if item.startswith("#"):
+                    break
+                if re.match(r"^\s*[-*]\s+", item):
+                    bullets.append(item.strip())
+                elif bullets and item.strip():
+                    break
+            if not bullets or not any(re.search(r"\blive or work\b.*\bcharter area\b", item, re.I)
+                                      for item in bullets):
+                continue
+            clean = lambda item: re.sub(r"\[([^]]+)\]\([^)]*\)", r"\1", item).lstrip("-* ").rstrip(". ")
+            text = "You may be eligible to join if " + "; or ".join(clean(item).removeprefix("You ")
+                                                             for item in bullets) + "."
+            sources = [Source(page.url, index.snapshot_id, item) for item in bullets]
+            for item in lines[max(0, heading - 24):heading]:
+                match = re.search(r"\bYou can find us in ([^.\n]{8,100})\.", item, re.I)
+                if match:
+                    text += " The same page describes local service in " + match.group(1).strip() + "."
+                    sources.append(Source(page.url, index.snapshot_id, item.strip()))
+                    break
+            return Answer(text, sources)
+    return None
+
+
 def retrieve_candidates(index, question, spec):
     """Retrieve only from the already selected full snapshot."""
     limit = 160 if spec.intent != "legacy" else 12
@@ -727,6 +770,9 @@ class LexicalKnowledge:
         index = self._select(as_of)
         if index is None:
             return Answer("I don't know; please contact us for details.", confident=False)
+        eligibility = _membership_eligibility_answer(index, question)
+        if eligibility is not None:
+            return eligibility
         spec = parse_request(question)
         if spec.intent != "legacy":
             retrieved = retrieve_candidates(index, question, spec)

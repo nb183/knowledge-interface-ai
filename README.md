@@ -19,4 +19,4 @@ python3 harness/run_eval.py --submission solution --snapshots snapshots --eval e
 python3 -m pytest -q solution
 ```
 
-`pytest` is optional tooling for the function-style tests, not a submission dependency. The submission has been verified with isolated Python 3.12; Python 3.11 is the target runtime. The latest public-kit QA baseline is **0.7388** across 40 questions; public-kit conflict accuracy is unmeasured because no conflict gold file is supplied. See `solution/NOTES.md` for implementation limits and `PLANS.md` and `DECISIONS.md` for the engineering history.
+`pytest` is optional tooling for the function-style tests, not a submission dependency. The submission has been verified with isolated Python 3.12; Python 3.11 is the target runtime. The latest public-kit QA score is **0.7698** across 40 questions; public-kit conflict accuracy is unmeasured because no conflict gold file is supplied. See `solution/NOTES.md` for implementation limits and `PLANS.md` and `DECISIONS.md` for the engineering history.
